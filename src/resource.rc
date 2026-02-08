@@ -1,0 +1,44 @@
+// Application icon
+// IDI_ICON1 must be 1 to be the default app icon
+1 ICON "../icon.ico"
+
+// Version information
+#include <winver.h>
+
+#define VER_MAJOR 1
+#define VER_MINOR 0
+#define VER_PATCH 0
+#define VER_BUILD 0
+
+#define STRINGIFY2(x) #x
+#define STRINGIFY(x) STRINGIFY2(x)
+#define VER_STRING STRINGIFY(VER_MAJOR) "." STRINGIFY(VER_MINOR) "." STRINGIFY(VER_PATCH) "." STRINGIFY(VER_BUILD)
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     VER_MAJOR, VER_MINOR, VER_PATCH, VER_BUILD
+PRODUCTVERSION  VER_MAJOR, VER_MINOR, VER_PATCH, VER_BUILD
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"  // English (US), Unicode
+        BEGIN
+            VALUE "CompanyName",      "Anees"
+            VALUE "FileDescription",  "FPS Overlay - Lightweight Performance Monitor"
+            VALUE "FileVersion",      VER_STRING
+            VALUE "InternalName",     "FPSOverlay"
+            VALUE "LegalCopyright",   "Copyright (c) 2026 Anees. MIT License."
+            VALUE "OriginalFilename", "overlay.exe"
+            VALUE "ProductName",      "FPS Overlay"
+            VALUE "ProductVersion",   VER_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0  // English (US), Unicode
+    END
+END
