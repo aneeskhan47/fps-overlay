@@ -69,6 +69,7 @@ static const char* ETW_SESSION_NAME = "FPSOverlay_ETW";
 // ═══════════════════════════════════════════════════════════════════════════
 typedef void* nvmlDevice_t;
 struct nvmlUtilization_t { unsigned int gpu; unsigned int memory; };
+struct nvmlMemory_t { unsigned long long total; unsigned long long free; unsigned long long used; };
 enum { NVML_TEMPERATURE_GPU = 0, NVML_SUCCESS = 0 };
 
 typedef int (*PFN_nvmlInit)(void);
@@ -78,6 +79,7 @@ typedef int (*PFN_nvmlDeviceGetHandleByIndex)(unsigned int, nvmlDevice_t*);
 typedef int (*PFN_nvmlDeviceGetUtilizationRates)(nvmlDevice_t, nvmlUtilization_t*);
 typedef int (*PFN_nvmlDeviceGetTemperature)(nvmlDevice_t, int, unsigned int*);
 typedef int (*PFN_nvmlDeviceGetName)(nvmlDevice_t, char*, unsigned int);
+typedef int (*PFN_nvmlDeviceGetMemoryInfo)(nvmlDevice_t, nvmlMemory_t*);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Configuration
@@ -86,6 +88,7 @@ struct OverlayConfig {
     bool showFPS  = true;
     bool showCPU  = true;
     bool showGPU  = true;
+    bool showVRAM = true;     // GPU VRAM usage
     bool showRAM  = true;
     bool horizontal = false;  // horizontal compact view
     int  position = 0;        // 0=TL  1=TR  2=BL  3=BR
@@ -127,8 +130,11 @@ static PFN_nvmlDeviceGetHandleByIndex   pfn_nvmlDeviceGetHandleByIndex = nullptr
 static PFN_nvmlDeviceGetUtilizationRates pfn_nvmlDeviceGetUtilRates = nullptr;
 static PFN_nvmlDeviceGetTemperature     pfn_nvmlDeviceGetTemp = nullptr;
 static PFN_nvmlDeviceGetName            pfn_nvmlDeviceGetName = nullptr;
+static PFN_nvmlDeviceGetMemoryInfo      pfn_nvmlDeviceGetMemInfo = nullptr;
 static float g_gpuUsage = 0.0f;
 static float g_gpuTemp  = 0.0f;
+static float g_vramUsed  = 0.0f;  // in GB
+static float g_vramTotal = 0.0f;  // in GB
 
 // ── ETW state ──
 static TRACEHANDLE      g_etwSession = 0;
@@ -465,10 +471,11 @@ static bool InitNvml()
     pfn_nvmlDeviceGetUtilRates = (PFN_nvmlDeviceGetUtilizationRates)(load("nvmlDeviceGetUtilizationRates"));
     pfn_nvmlDeviceGetTemp      = (PFN_nvmlDeviceGetTemperature)(load("nvmlDeviceGetTemperature"));
     pfn_nvmlDeviceGetName      = (PFN_nvmlDeviceGetName)(load("nvmlDeviceGetName"));
+    pfn_nvmlDeviceGetMemInfo   = (PFN_nvmlDeviceGetMemoryInfo)(load("nvmlDeviceGetMemoryInfo"));
 
     if (!pfn_nvmlInit || !pfn_nvmlShutdown || !pfn_nvmlDeviceGetCount ||
         !pfn_nvmlDeviceGetHandleByIndex || !pfn_nvmlDeviceGetUtilRates ||
-        !pfn_nvmlDeviceGetTemp)
+        !pfn_nvmlDeviceGetTemp || !pfn_nvmlDeviceGetMemInfo)
     {
         FreeLibrary(g_hNvml); g_hNvml = nullptr;
         return false;
@@ -514,6 +521,11 @@ static void PollGpuStats()
     unsigned int temp = 0;
     if (pfn_nvmlDeviceGetTemp(g_nvmlDevice, NVML_TEMPERATURE_GPU, &temp) == NVML_SUCCESS)
         g_gpuTemp = (float)temp;
+    nvmlMemory_t mem = {};
+    if (pfn_nvmlDeviceGetMemInfo(g_nvmlDevice, &mem) == NVML_SUCCESS) {
+        g_vramUsed  = (float)mem.used  / (1024.0f * 1024.0f * 1024.0f);  // bytes to GB
+        g_vramTotal = (float)mem.total / (1024.0f * 1024.0f * 1024.0f);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -996,7 +1008,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::SetWindowFontScale(1.4f);
             ImGui::TextColored(ImVec4(.35f,.78f,1,1), "FPS Overlay");
             ImGui::SetWindowFontScale(1.0f);
-            ImGui::SameLine(); ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " Beta 1.0");
+            ImGui::SameLine(); ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " Beta v1.1.0");
 
             // Developer text
             ImGui::Spacing();
@@ -1015,6 +1027,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             }
             ImGui::Checkbox("  CPU Usage", &g_Config.showCPU);
             ImGui::Checkbox("  GPU Usage & Temp", &g_Config.showGPU);
+            if (!g_nvmlOk) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(.6f,.5f,.2f,1), "(NVIDIA only)");
+            }
+            ImGui::Checkbox("  GPU VRAM Usage", &g_Config.showVRAM);
             if (!g_nvmlOk) {
                 ImGui::SameLine();
                 ImGui::TextColored(ImVec4(.6f,.5f,.2f,1), "(NVIDIA only)");
@@ -1334,6 +1351,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     needSep = true;
                 }
                 
+                // VRAM (separate section in horizontal view)
+                if (g_Config.showVRAM && g_nvmlOk && g_vramTotal > 0) {
+                    if (needSep) { ImGui::SameLine(); ImGui::TextColored(ImVec4(.35f,.35f,.40f,1), " | "); ImGui::SameLine(); }
+                    float vramPct = (g_vramUsed / g_vramTotal) * 100.0f;
+                    ImGui::TextColored(ColorByLoad(vramPct), "VRAM %.0f%% %.1f/%.0fG", vramPct, g_vramUsed, g_vramTotal);
+                    needSep = true;
+                }
+                
                 // RAM
                 if (g_Config.showRAM) {
                     if (needSep) { ImGui::SameLine(); ImGui::TextColored(ImVec4(.35f,.35f,.40f,1), " | "); ImGui::SameLine(); }
@@ -1405,6 +1430,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                                   : g_gpuTemp > 70 ? ImVec4(1,.85f,.15f,1)
                                                    : ImVec4(.70f,.70f,.75f,1);
                         ImGui::TextColored(tc, " %.0f\xC2\xB0""C", g_gpuTemp);
+                        // VRAM usage
+                        if (g_Config.showVRAM && g_vramTotal > 0) {
+                            float vramPct = (g_vramUsed / g_vramTotal) * 100.0f;
+                            ImGui::TextColored(ColorByLoad(vramPct), "VRAM %.0f%%", vramPct);
+                            ImGui::SameLine();
+                            ImGui::TextColored(ImVec4(.70f,.70f,.75f,1), " %.1f / %.0f GB", g_vramUsed, g_vramTotal);
+                        }
                     } else {
                         ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "GPU  N/A");
                     }

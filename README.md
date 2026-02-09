@@ -10,6 +10,7 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 
 - **FPS** — Real game framerate via Windows ETW (same method the pros use)
 - **GPU** — Usage & temperature (NVIDIA via NVML, with fallback for others)
+- **VRAM** — GPU memory usage percentage and used/total GB
 - **CPU** — Usage & temperature
 - **RAM** — Usage percentage and used/total GB
 - **Process tracking** — Shows which game/app is being monitored
