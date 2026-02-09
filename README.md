@@ -2,7 +2,7 @@
 
 A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while gaming — nothing else.
 
-![Size](https://img.shields.io/badge/size-~4MB-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![License](https://img.shields.io/badge/license-MIT-green)
+![Size](https://img.shields.io/badge/size-~4MB-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![License](https://img.shields.io/badge/license-GNU%20GPLv3-green)
 
 ## Features
 
