@@ -2,7 +2,7 @@
 //
 // Features:
 //   - Real game FPS via ETW (Event Tracing for Windows — hooks DXGI Present)
-//   - GPU usage & temperature via NVML (NVIDIA) with graceful fallback
+//   - GPU usage & temperature via LibreHardwareMonitor (supports NVIDIA, AMD, Intel)
 //   - CPU / RAM monitoring
 //   - Hardware names (CPU model, GPU model)
 //   - Custom hotkey binding
@@ -31,8 +31,11 @@
 #include <algorithm>
 
 // Note: Link with -lwbemuuid -lole32 -loleaut32 for WMI support
+// Note: Link with lhwm-cpp-wrapper.lib and mscoree.lib for LibreHardwareMonitor support
 
 #include "imgui.h"
+#include "lhwm-cpp-wrapper.h"
+#include <tuple>
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 
@@ -65,23 +68,6 @@ static const GUID DXGI_PROVIDER =
 static const char* ETW_SESSION_NAME = "FPSOverlay_ETW";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// NVML types (defined here so we don't need the NVML SDK)
-// ═══════════════════════════════════════════════════════════════════════════
-typedef void* nvmlDevice_t;
-struct nvmlUtilization_t { unsigned int gpu; unsigned int memory; };
-struct nvmlMemory_t { unsigned long long total; unsigned long long free; unsigned long long used; };
-enum { NVML_TEMPERATURE_GPU = 0, NVML_SUCCESS = 0 };
-
-typedef int (*PFN_nvmlInit)(void);
-typedef int (*PFN_nvmlShutdown)(void);
-typedef int (*PFN_nvmlDeviceGetCount)(unsigned int*);
-typedef int (*PFN_nvmlDeviceGetHandleByIndex)(unsigned int, nvmlDevice_t*);
-typedef int (*PFN_nvmlDeviceGetUtilizationRates)(nvmlDevice_t, nvmlUtilization_t*);
-typedef int (*PFN_nvmlDeviceGetTemperature)(nvmlDevice_t, int, unsigned int*);
-typedef int (*PFN_nvmlDeviceGetName)(nvmlDevice_t, char*, unsigned int);
-typedef int (*PFN_nvmlDeviceGetMemoryInfo)(nvmlDevice_t, nvmlMemory_t*);
-
-// ═══════════════════════════════════════════════════════════════════════════
 // Configuration
 // ═══════════════════════════════════════════════════════════════════════════
 struct OverlayConfig {
@@ -91,13 +77,153 @@ struct OverlayConfig {
     bool showVRAM = true;     // GPU VRAM usage
     bool showRAM  = true;
     bool horizontal = false;  // horizontal compact view
+    bool useFahrenheit = false; // false = Celsius, true = Fahrenheit
     int  position = 0;        // 0=TL  1=TR  2=BL  3=BR
     int  opacity  = 85;       // 30..100 %
     int  toggleKey = VK_INSERT;
     int  exitKey   = VK_END;
     float customX = -1.0f;    // custom position (-1 = use corner preset)
     float customY = -1.0f;
+    int  selectedGpu = 0;     // selected GPU index (0 = first GPU)
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GPU list (for multi-GPU support via LHWM)
+// ═══════════════════════════════════════════════════════════════════════════
+#define MAX_GPUS 8
+struct GpuInfo {
+    char name[256];
+    std::string tempPath;      // LHWM sensor path for temperature
+    std::string loadPath;      // LHWM sensor path for GPU load
+    std::string vramUsedPath;  // LHWM sensor path for VRAM used
+    std::string vramTotalPath; // LHWM sensor path for VRAM total
+};
+static GpuInfo g_gpuList[MAX_GPUS];
+static int g_gpuCount = 0;
+
+// Helper to convert Celsius to Fahrenheit
+inline float ToDisplayTemp(float celsius, bool useFahrenheit) {
+    return useFahrenheit ? (celsius * 9.0f / 5.0f + 32.0f) : celsius;
+}
+
+// Temperature thresholds (in Celsius) - adjust for F display comparison
+inline float GetHighTempThreshold(bool useFahrenheit) { return useFahrenheit ? 185.0f : 85.0f; }
+inline float GetMedTempThreshold(bool useFahrenheit) { return useFahrenheit ? 158.0f : 70.0f; }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Configuration file (INI) - saved next to overlay.exe
+// ═══════════════════════════════════════════════════════════════════════════
+static char g_configPath[MAX_PATH] = "";
+
+static void InitConfigPath()
+{
+    if (g_configPath[0] != '\0') return; // already initialized
+    
+    // Get the directory where the executable is located
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    
+    // Remove the executable name to get the directory
+    char* lastSlash = strrchr(exePath, '\\');
+    if (lastSlash) *(lastSlash + 1) = '\0';
+    
+    // Append the config filename
+    snprintf(g_configPath, MAX_PATH, "%sconfig.ini", exePath);
+}
+
+static int ReadIniInt(const char* section, const char* key, int defaultVal)
+{
+    return GetPrivateProfileIntA(section, key, defaultVal, g_configPath);
+}
+
+static float ReadIniFloat(const char* section, const char* key, float defaultVal)
+{
+    char buf[32];
+    GetPrivateProfileStringA(section, key, "", buf, sizeof(buf), g_configPath);
+    if (buf[0] == '\0') return defaultVal;
+    return (float)atof(buf);
+}
+
+static void WriteIniInt(const char* section, const char* key, int value)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d", value);
+    WritePrivateProfileStringA(section, key, buf, g_configPath);
+}
+
+static void WriteIniFloat(const char* section, const char* key, float value)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.2f", value);
+    WritePrivateProfileStringA(section, key, buf, g_configPath);
+}
+
+static void LoadConfig(OverlayConfig& cfg)
+{
+    InitConfigPath();
+    
+    // Check if config file exists
+    DWORD attrib = GetFileAttributesA(g_configPath);
+    if (attrib == INVALID_FILE_ATTRIBUTES) {
+        // No config file, use defaults
+        return;
+    }
+    
+    // Display settings
+    cfg.showFPS       = ReadIniInt("Display", "showFPS", 1) != 0;
+    cfg.showCPU       = ReadIniInt("Display", "showCPU", 1) != 0;
+    cfg.showGPU       = ReadIniInt("Display", "showGPU", 1) != 0;
+    cfg.showVRAM      = ReadIniInt("Display", "showVRAM", 1) != 0;
+    cfg.showRAM       = ReadIniInt("Display", "showRAM", 1) != 0;
+    
+    // Layout settings
+    cfg.horizontal    = ReadIniInt("Layout", "horizontal", 0) != 0;
+    cfg.useFahrenheit = ReadIniInt("Layout", "useFahrenheit", 0) != 0;
+    cfg.position      = ReadIniInt("Layout", "position", 0);
+    cfg.opacity       = ReadIniInt("Layout", "opacity", 85);
+    cfg.customX       = ReadIniFloat("Layout", "customX", -1.0f);
+    cfg.customY       = ReadIniFloat("Layout", "customY", -1.0f);
+    
+    // Hotkeys
+    cfg.toggleKey     = ReadIniInt("Hotkeys", "toggleKey", VK_INSERT);
+    cfg.exitKey       = ReadIniInt("Hotkeys", "exitKey", VK_END);
+    
+    // GPU selection
+    cfg.selectedGpu   = ReadIniInt("GPU", "selectedGpu", 0);
+    
+    // Clamp values to valid ranges
+    if (cfg.position < 0 || cfg.position > 3) cfg.position = 0;
+    if (cfg.opacity < 30) cfg.opacity = 30;
+    if (cfg.opacity > 100) cfg.opacity = 100;
+    if (cfg.selectedGpu < 0) cfg.selectedGpu = 0;
+}
+
+static void SaveConfig(const OverlayConfig& cfg)
+{
+    InitConfigPath();
+    
+    // Display settings
+    WriteIniInt("Display", "showFPS", cfg.showFPS ? 1 : 0);
+    WriteIniInt("Display", "showCPU", cfg.showCPU ? 1 : 0);
+    WriteIniInt("Display", "showGPU", cfg.showGPU ? 1 : 0);
+    WriteIniInt("Display", "showVRAM", cfg.showVRAM ? 1 : 0);
+    WriteIniInt("Display", "showRAM", cfg.showRAM ? 1 : 0);
+    
+    // Layout settings
+    WriteIniInt("Layout", "horizontal", cfg.horizontal ? 1 : 0);
+    WriteIniInt("Layout", "useFahrenheit", cfg.useFahrenheit ? 1 : 0);
+    WriteIniInt("Layout", "position", cfg.position);
+    WriteIniInt("Layout", "opacity", cfg.opacity);
+    WriteIniFloat("Layout", "customX", cfg.customX);
+    WriteIniFloat("Layout", "customY", cfg.customY);
+    
+    // Hotkeys
+    WriteIniInt("Hotkeys", "toggleKey", cfg.toggleKey);
+    WriteIniInt("Hotkeys", "exitKey", cfg.exitKey);
+    
+    // GPU selection
+    WriteIniInt("GPU", "selectedGpu", cfg.selectedGpu);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // App state
@@ -119,18 +245,7 @@ static NOTIFYICONDATA g_nid      = {};
 static char g_cpuName[256] = "Unknown";
 static char g_gpuName[256] = "Unknown";
 
-// ── NVML state ──
-static HMODULE       g_hNvml        = nullptr;
-static nvmlDevice_t  g_nvmlDevice   = nullptr;
-static bool          g_nvmlOk       = false;
-static PFN_nvmlInit                     pfn_nvmlInit = nullptr;
-static PFN_nvmlShutdown                 pfn_nvmlShutdown = nullptr;
-static PFN_nvmlDeviceGetCount           pfn_nvmlDeviceGetCount = nullptr;
-static PFN_nvmlDeviceGetHandleByIndex   pfn_nvmlDeviceGetHandleByIndex = nullptr;
-static PFN_nvmlDeviceGetUtilizationRates pfn_nvmlDeviceGetUtilRates = nullptr;
-static PFN_nvmlDeviceGetTemperature     pfn_nvmlDeviceGetTemp = nullptr;
-static PFN_nvmlDeviceGetName            pfn_nvmlDeviceGetName = nullptr;
-static PFN_nvmlDeviceGetMemoryInfo      pfn_nvmlDeviceGetMemInfo = nullptr;
+// ── GPU stats (from LHWM) ──
 static float g_gpuUsage = 0.0f;
 static float g_gpuTemp  = 0.0f;
 static float g_vramUsed  = 0.0f;  // in GB
@@ -152,6 +267,19 @@ static char               g_targetProcessName[128] = "";  // current tracked pro
 // ── CPU temperature (WMI) ──
 static float g_cpuTemp = 0.0f;
 static bool  g_cpuTempAvailable = false;
+
+// ── LibreHardwareMonitor (LHWM) state ──
+static bool  g_lhwmAvailable = false;
+static std::string g_lhwmCpuTempPath;      // e.g., "/amdcpu/0/temperature/3"
+static std::string g_lhwmGpuTempPath;      // e.g., "/gpu-nvidia/0/temperature/0"
+static std::string g_lhwmGpuLoadPath;      // e.g., "/gpu-nvidia/0/load/0"
+static std::string g_lhwmGpuVramUsedPath;  // VRAM used
+static std::string g_lhwmGpuVramTotalPath; // VRAM total
+static float g_lhwmCpuTemp = 0.0f;
+static float g_lhwmGpuTemp = 0.0f;
+static float g_lhwmGpuLoad = 0.0f;
+static float g_lhwmGpuVramUsed = 0.0f;     // in GB
+static float g_lhwmGpuVramTotal = 0.0f;    // in GB
 
 // ── DX11 ──
 static ID3D11Device*           g_pd3dDevice        = nullptr;
@@ -452,80 +580,243 @@ static float QueryCpuTemperature()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// NVML — dynamic loading (GPU usage & temp, NVIDIA only)
+// LibreHardwareMonitor (LHWM) — cross-vendor hardware monitoring
 // ═══════════════════════════════════════════════════════════════════════════
-static bool InitNvml()
-{
-    g_hNvml = LoadLibraryA("nvml.dll");
-    if (!g_hNvml)
-        g_hNvml = LoadLibraryA("C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll");
-    if (!g_hNvml) return false;
-
-    auto load = [](const char* name) { return GetProcAddress(g_hNvml, name); };
-
-    pfn_nvmlInit         = (PFN_nvmlInit)        (load("nvmlInit_v2")         ? load("nvmlInit_v2")         : load("nvmlInit"));
-    pfn_nvmlShutdown     = (PFN_nvmlShutdown)    (load("nvmlShutdown"));
-    pfn_nvmlDeviceGetCount = (PFN_nvmlDeviceGetCount)(load("nvmlDeviceGetCount_v2") ? load("nvmlDeviceGetCount_v2") : load("nvmlDeviceGetCount"));
-    pfn_nvmlDeviceGetHandleByIndex = (PFN_nvmlDeviceGetHandleByIndex)
-        (load("nvmlDeviceGetHandleByIndex_v2") ? load("nvmlDeviceGetHandleByIndex_v2") : load("nvmlDeviceGetHandleByIndex"));
-    pfn_nvmlDeviceGetUtilRates = (PFN_nvmlDeviceGetUtilizationRates)(load("nvmlDeviceGetUtilizationRates"));
-    pfn_nvmlDeviceGetTemp      = (PFN_nvmlDeviceGetTemperature)(load("nvmlDeviceGetTemperature"));
-    pfn_nvmlDeviceGetName      = (PFN_nvmlDeviceGetName)(load("nvmlDeviceGetName"));
-    pfn_nvmlDeviceGetMemInfo   = (PFN_nvmlDeviceGetMemoryInfo)(load("nvmlDeviceGetMemoryInfo"));
-
-    if (!pfn_nvmlInit || !pfn_nvmlShutdown || !pfn_nvmlDeviceGetCount ||
-        !pfn_nvmlDeviceGetHandleByIndex || !pfn_nvmlDeviceGetUtilRates ||
-        !pfn_nvmlDeviceGetTemp || !pfn_nvmlDeviceGetMemInfo)
-    {
-        FreeLibrary(g_hNvml); g_hNvml = nullptr;
-        return false;
-    }
-
-    if (pfn_nvmlInit() != NVML_SUCCESS) {
-        FreeLibrary(g_hNvml); g_hNvml = nullptr;
-        return false;
-    }
-
-    unsigned int count = 0;
-    pfn_nvmlDeviceGetCount(&count);
-    if (count == 0) { pfn_nvmlShutdown(); FreeLibrary(g_hNvml); g_hNvml = nullptr; return false; }
-
-    pfn_nvmlDeviceGetHandleByIndex(0, &g_nvmlDevice);
-
-    // Optionally grab the GPU name from NVML (often more detailed)
-    if (pfn_nvmlDeviceGetName) {
-        char nvName[256];
-        if (pfn_nvmlDeviceGetName(g_nvmlDevice, nvName, sizeof(nvName)) == NVML_SUCCESS)
-            snprintf(g_gpuName, sizeof(g_gpuName), "%s", nvName);
-    }
-
-    return true;
+// Helper to check if a hardware name is a GPU (excluding integrated graphics)
+static bool IsDiscreteGpu(const std::string& name) {
+    // Check for discrete GPU identifiers
+    bool isGpu = (name.find("GeForce") != std::string::npos ||
+                  name.find("RTX") != std::string::npos ||
+                  name.find("GTX") != std::string::npos ||
+                  name.find("Radeon RX") != std::string::npos ||
+                  name.find("Radeon Pro") != std::string::npos ||
+                  name.find("Arc") != std::string::npos ||  // Intel Arc
+                  name.find("NVIDIA") != std::string::npos);
+    
+    // Exclude integrated graphics
+    bool isIntegrated = (name.find("Radeon Graphics") != std::string::npos ||  // AMD APU
+                         name.find("Intel UHD") != std::string::npos ||
+                         name.find("Intel HD") != std::string::npos ||
+                         name.find("Intel Iris") != std::string::npos);
+    
+    return isGpu && !isIntegrated;
 }
 
-static void ShutdownNvml()
-{
-    if (g_hNvml) {
-        if (pfn_nvmlShutdown) pfn_nvmlShutdown();
-        FreeLibrary(g_hNvml);
-        g_hNvml = nullptr;
+// Find an existing GPU in the list by name, or return -1
+static int FindGpuByName(const char* name) {
+    for (int i = 0; i < g_gpuCount; i++) {
+        if (strcmp(g_gpuList[i].name, name) == 0) return i;
     }
-    g_nvmlOk = false;
+    return -1;
 }
 
-static void PollGpuStats()
+static bool InitLHWM()
 {
-    if (!g_nvmlOk) return;
-    nvmlUtilization_t util = {};
-    if (pfn_nvmlDeviceGetUtilRates(g_nvmlDevice, &util) == NVML_SUCCESS)
-        g_gpuUsage = (float)util.gpu;
-    unsigned int temp = 0;
-    if (pfn_nvmlDeviceGetTemp(g_nvmlDevice, NVML_TEMPERATURE_GPU, &temp) == NVML_SUCCESS)
-        g_gpuTemp = (float)temp;
-    nvmlMemory_t mem = {};
-    if (pfn_nvmlDeviceGetMemInfo(g_nvmlDevice, &mem) == NVML_SUCCESS) {
-        g_vramUsed  = (float)mem.used  / (1024.0f * 1024.0f * 1024.0f);  // bytes to GB
-        g_vramTotal = (float)mem.total / (1024.0f * 1024.0f * 1024.0f);
+    try {
+        auto sensors = LHWM::GetHardwareSensorMap();
+        if (sensors.empty()) return false;
+        
+        // Debug: write sensor list to file for troubleshooting
+        FILE* dbg = nullptr;
+        fopen_s(&dbg, "lhwm_sensors.txt", "w");
+        if (dbg) {
+            fprintf(dbg, "LHWM Sensors Found:\n");
+            fprintf(dbg, "==================\n\n");
+        }
+        
+        // The map structure from lhwm-cpp-wrapper is:
+        // Key (map key) = Hardware name (e.g., "AMD Ryzen 9 5900HS...")
+        // Value = vector<tuple<sensorName, sensorType, sensorPath>>
+        //   tuple[0] = Sensor name (e.g., "CPU Core #1", "GPU Core")
+        //   tuple[1] = Sensor type (e.g., "Temperature", "Load")
+        //   tuple[2] = Sensor path (e.g., "/amdcpu/0/temperature/0")
+        
+        std::string cpuTempFallback;
+        g_gpuCount = 0;  // Reset GPU count
+        
+        for (const auto& [hardwareName, sensorList] : sensors) {
+            // Debug: log hardware name
+            if (dbg) {
+                fprintf(dbg, "Hardware: %s\n", hardwareName.c_str());
+            }
+            
+            // Check if this is CPU or GPU hardware by hardware name
+            bool isCpuHardware = (hardwareName.find("Ryzen") != std::string::npos ||
+                                  hardwareName.find("Intel") != std::string::npos ||
+                                  hardwareName.find("CPU") != std::string::npos ||
+                                  hardwareName.find("Core") != std::string::npos);
+            
+            bool isDiscreteGpuHardware = IsDiscreteGpu(hardwareName);
+            
+            // If this is a discrete GPU, find or create entry in GPU list
+            int gpuIndex = -1;
+            if (isDiscreteGpuHardware && g_gpuCount < MAX_GPUS) {
+                gpuIndex = FindGpuByName(hardwareName.c_str());
+                if (gpuIndex < 0) {
+                    // New GPU - add to list
+                    gpuIndex = g_gpuCount;
+                    snprintf(g_gpuList[gpuIndex].name, sizeof(g_gpuList[gpuIndex].name), "%s", hardwareName.c_str());
+                    g_gpuList[gpuIndex].tempPath.clear();
+                    g_gpuList[gpuIndex].loadPath.clear();
+                    g_gpuList[gpuIndex].vramUsedPath.clear();
+                    g_gpuList[gpuIndex].vramTotalPath.clear();
+                    g_gpuCount++;
+                }
+            }
+            
+            // Iterate through all sensors for this hardware
+            for (const auto& sensorInfo : sensorList) {
+                const auto& [sensorName, sensorType, sensorPath] = sensorInfo;
+                
+                // Debug output
+                if (dbg) {
+                    fprintf(dbg, "  Sensor: %s\n", sensorName.c_str());
+                    fprintf(dbg, "    Type: %s\n", sensorType.c_str());
+                    fprintf(dbg, "    Path: %s\n", sensorPath.c_str());
+                }
+                
+                // Also detect by path pattern
+                bool isCpuPath = (sensorPath.find("/amdcpu/") != std::string::npos ||
+                                  sensorPath.find("/intelcpu/") != std::string::npos);
+                bool isGpuPath = (sensorPath.find("/gpu-nvidia/") != std::string::npos ||
+                                  sensorPath.find("/gpu-amd/") != std::string::npos ||
+                                  sensorPath.find("/gpu-intel/") != std::string::npos);
+                
+                // CPU temperature sensors
+                if ((isCpuHardware || isCpuPath) && sensorType == "Temperature") {
+                    // Prefer Package, Tctl/Tdie, or Core temps
+                    if (sensorName.find("Package") != std::string::npos ||
+                        sensorName.find("Tctl") != std::string::npos ||
+                        sensorName.find("Tdie") != std::string::npos ||
+                        sensorName.find("Core (Tctl/Tdie)") != std::string::npos) {
+                        g_lhwmCpuTempPath = sensorPath;
+                    } else if (g_lhwmCpuTempPath.empty()) {
+                        cpuTempFallback = sensorPath;
+                    }
+                }
+                
+                // GPU sensors - store in the GPU's entry
+                if (gpuIndex >= 0) {
+                    if (sensorType == "Temperature") {
+                        if (sensorName.find("Core") != std::string::npos || 
+                            sensorName.find("GPU") != std::string::npos ||
+                            g_gpuList[gpuIndex].tempPath.empty()) {
+                            g_gpuList[gpuIndex].tempPath = sensorPath;
+                        }
+                    }
+                    else if (sensorType == "Load") {
+                        if (sensorName.find("Core") != std::string::npos || 
+                            sensorName.find("GPU") != std::string::npos ||
+                            g_gpuList[gpuIndex].loadPath.empty()) {
+                            g_gpuList[gpuIndex].loadPath = sensorPath;
+                        }
+                    }
+                    else if (sensorType == "SmallData" || sensorType == "Data") {
+                        if (sensorName.find("Memory Used") != std::string::npos ||
+                            sensorName.find("GPU Memory Used") != std::string::npos) {
+                            g_gpuList[gpuIndex].vramUsedPath = sensorPath;
+                        }
+                        else if (sensorName.find("Memory Total") != std::string::npos ||
+                                 sensorName.find("GPU Memory Total") != std::string::npos) {
+                            g_gpuList[gpuIndex].vramTotalPath = sensorPath;
+                        }
+                    }
+                }
+            }
+            
+            if (dbg) fprintf(dbg, "\n");
+        }
+        
+        // Use fallback CPU temp if needed
+        if (g_lhwmCpuTempPath.empty() && !cpuTempFallback.empty()) {
+            g_lhwmCpuTempPath = cpuTempFallback;
+        }
+        
+        // Clamp selected GPU to valid range
+        if (g_Config.selectedGpu >= g_gpuCount) {
+            g_Config.selectedGpu = 0;
+        }
+        
+        // Set active GPU paths and name
+        if (g_gpuCount > 0) {
+            int idx = g_Config.selectedGpu;
+            g_lhwmGpuTempPath = g_gpuList[idx].tempPath;
+            g_lhwmGpuLoadPath = g_gpuList[idx].loadPath;
+            g_lhwmGpuVramUsedPath = g_gpuList[idx].vramUsedPath;
+            g_lhwmGpuVramTotalPath = g_gpuList[idx].vramTotalPath;
+            snprintf(g_gpuName, sizeof(g_gpuName), "%s", g_gpuList[idx].name);
+        }
+        
+        if (dbg) {
+            fprintf(dbg, "==================\n");
+            fprintf(dbg, "GPUs Found: %d\n", g_gpuCount);
+            for (int i = 0; i < g_gpuCount; i++) {
+                fprintf(dbg, "  [%d] %s\n", i, g_gpuList[i].name);
+                fprintf(dbg, "      Temp: %s\n", g_gpuList[i].tempPath.empty() ? "(none)" : g_gpuList[i].tempPath.c_str());
+                fprintf(dbg, "      Load: %s\n", g_gpuList[i].loadPath.empty() ? "(none)" : g_gpuList[i].loadPath.c_str());
+            }
+            fprintf(dbg, "\nSelected Sensors:\n");
+            fprintf(dbg, "  CPU Temp: %s\n", g_lhwmCpuTempPath.empty() ? "(none)" : g_lhwmCpuTempPath.c_str());
+            fprintf(dbg, "  GPU Temp: %s\n", g_lhwmGpuTempPath.empty() ? "(none)" : g_lhwmGpuTempPath.c_str());
+            fprintf(dbg, "  GPU Load: %s\n", g_lhwmGpuLoadPath.empty() ? "(none)" : g_lhwmGpuLoadPath.c_str());
+            fclose(dbg);
+        }
+        
+        return !g_lhwmCpuTempPath.empty() || g_gpuCount > 0;
     }
+    catch (...) {
+        return false;
+    }
+}
+
+static void PollLHWMStats()
+{
+    if (!g_lhwmAvailable) return;
+    
+    try {
+        // CPU temperature
+        if (!g_lhwmCpuTempPath.empty()) {
+            g_lhwmCpuTemp = LHWM::GetSensorValue(g_lhwmCpuTempPath);
+        }
+        
+        // GPU stats - update both LHWM-specific and unified variables
+        if (!g_lhwmGpuTempPath.empty()) {
+            g_lhwmGpuTemp = LHWM::GetSensorValue(g_lhwmGpuTempPath);
+            g_gpuTemp = g_lhwmGpuTemp;
+        }
+        if (!g_lhwmGpuLoadPath.empty()) {
+            g_lhwmGpuLoad = LHWM::GetSensorValue(g_lhwmGpuLoadPath);
+            g_gpuUsage = g_lhwmGpuLoad;
+        }
+        if (!g_lhwmGpuVramUsedPath.empty()) {
+            // Value is in MB, convert to GB
+            g_lhwmGpuVramUsed = LHWM::GetSensorValue(g_lhwmGpuVramUsedPath) / 1024.0f;
+            g_vramUsed = g_lhwmGpuVramUsed;
+        }
+        if (!g_lhwmGpuVramTotalPath.empty()) {
+            g_lhwmGpuVramTotal = LHWM::GetSensorValue(g_lhwmGpuVramTotalPath) / 1024.0f;
+            g_vramTotal = g_lhwmGpuVramTotal;
+        }
+    }
+    catch (...) {
+        // Silently ignore polling errors
+    }
+}
+
+// Switch to a different GPU by index
+static void SelectGpu(int index)
+{
+    if (index < 0 || index >= g_gpuCount) return;
+    
+    g_Config.selectedGpu = index;
+    
+    // Update active sensor paths
+    g_lhwmGpuTempPath = g_gpuList[index].tempPath;
+    g_lhwmGpuLoadPath = g_gpuList[index].loadPath;
+    g_lhwmGpuVramUsedPath = g_gpuList[index].vramUsedPath;
+    g_lhwmGpuVramTotalPath = g_gpuList[index].vramTotalPath;
+    
+    snprintf(g_gpuName, sizeof(g_gpuName), "%s", g_gpuList[index].name);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -866,6 +1157,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 {
     g_hInstance = hInst;
 
+    // ── Load saved configuration ──
+    LoadConfig(g_Config);
+
     // ── Query hardware ──
     QueryCpuName();
 
@@ -891,40 +1185,32 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         cx, cy, cw, ch, nullptr, nullptr, hInst, nullptr);
     if (!g_hwnd) return 1;
 
-    // ── Check admin privileges (after window creation so MessageBox shows our icon) ──
+    // ── Check admin privileges (app should always run as admin via manifest) ──
     g_isAdmin = IsRunningAsAdmin();
-    if (!g_isAdmin) {
-        int result = MessageBox(g_hwnd,
-            "FPS Overlay is not running as Administrator.\n\n"
-            "Without admin rights, game FPS tracking will NOT work.\n"
-            "Only CPU, GPU, and RAM stats will be available.\n\n"
-            "Do you want to continue anyway?",
-            "FPS Overlay - Admin Required",
-            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
-        if (result == IDNO) {
-            DestroyWindow(g_hwnd);
-            UnregisterClass(wc.lpszClassName, hInst);
-            return 0;
-        }
-    }
 
     if (!CreateDeviceD3D(g_hwnd)) {
         MessageBox(g_hwnd, "DirectX 11 initialisation failed.", "FPS Overlay", MB_OK | MB_ICONERROR);
         CleanupDeviceD3D(); return 1;
     }
 
-    // Get GPU name from DXGI adapter (before NVML may override with a better name)
+    // Get GPU name from DXGI adapter (fallback if LHWM doesn't provide it)
     QueryGpuName();
 
-    // Try NVML
-    g_nvmlOk = InitNvml();
+    // Initialize LibreHardwareMonitor for GPU and CPU temperature monitoring
+    // Supports NVIDIA, AMD, and Intel GPUs
+    g_lhwmAvailable = InitLHWM();
     
-    // Try WMI for CPU temperature
+    // Try WMI for CPU temperature as fallback
     g_cpuTempAvailable = InitWMI();
     if (g_cpuTempAvailable) {
         // Test if we can actually get a temperature reading
         float testTemp = QueryCpuTemperature();
         g_cpuTempAvailable = (testTemp > 0.0f && testTemp < 150.0f);
+    }
+    
+    // LHWM provides CPU temp, so mark as available if we have it
+    if (g_lhwmAvailable && !g_lhwmCpuTempPath.empty()) {
+        g_cpuTempAvailable = true;
     }
 
     ShowWindow(g_hwnd, SW_SHOW);
@@ -1027,16 +1313,46 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             }
             ImGui::Checkbox("  CPU Usage", &g_Config.showCPU);
             ImGui::Checkbox("  GPU Usage & Temp", &g_Config.showGPU);
-            if (!g_nvmlOk) {
+            if (!g_lhwmAvailable || g_gpuCount == 0) {
                 ImGui::SameLine();
-                ImGui::TextColored(ImVec4(.6f,.5f,.2f,1), "(NVIDIA only)");
+                ImGui::TextColored(ImVec4(.9f,.4f,.2f,1), "(unavailable)");
             }
             ImGui::Checkbox("  GPU VRAM Usage", &g_Config.showVRAM);
-            if (!g_nvmlOk) {
+            if (!g_lhwmAvailable || g_gpuCount == 0) {
                 ImGui::SameLine();
-                ImGui::TextColored(ImVec4(.6f,.5f,.2f,1), "(NVIDIA only)");
+                ImGui::TextColored(ImVec4(.9f,.4f,.2f,1), "(unavailable)");
             }
             ImGui::Checkbox("  RAM Usage", &g_Config.showRAM);
+
+            // ── GPU SELECTION ──
+            if (g_gpuCount > 0) {
+                ImGui::Spacing(); ImGui::Spacing();
+                ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "GPU SELECTION");
+                ImGui::Spacing();
+                
+                // Build combo preview string
+                const char* previewName = (g_Config.selectedGpu >= 0 && g_Config.selectedGpu < g_gpuCount) 
+                    ? g_gpuList[g_Config.selectedGpu].name 
+                    : "Select GPU...";
+                
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::BeginCombo("##gpuselect", previewName)) {
+                    for (int i = 0; i < g_gpuCount; i++) {
+                        bool isSelected = (g_Config.selectedGpu == i);
+                        if (ImGui::Selectable(g_gpuList[i].name, isSelected)) {
+                            SelectGpu(i);
+                        }
+                        if (isSelected) {
+                            ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                
+                if (g_gpuCount > 1) {
+                    ImGui::TextColored(ImVec4(.45f,.45f,.50f,1), "Multiple GPUs detected - select which to monitor");
+                }
+            }
 
             // ── POSITION ──
             ImGui::Spacing(); ImGui::Spacing();
@@ -1060,6 +1376,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "LAYOUT");
             ImGui::Spacing();
             ImGui::Checkbox("  Horizontal Compact View", &g_Config.horizontal);
+            
+            // ── TEMPERATURE UNIT ──
+            ImGui::Spacing(); ImGui::Spacing();
+            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "TEMPERATURE");
+            ImGui::Spacing();
+            int tempUnit = g_Config.useFahrenheit ? 1 : 0;
+            if (ImGui::RadioButton("Celsius", &tempUnit, 0)) g_Config.useFahrenheit = false;
+            ImGui::SameLine(0,24);
+            if (ImGui::RadioButton("Fahrenheit", &tempUnit, 1)) g_Config.useFahrenheit = true;
 
             // ── OPACITY ──
             ImGui::Spacing(); ImGui::Spacing();
@@ -1179,8 +1504,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             float cpuElapsed = std::chrono::duration<float>(now - lastCpuTime).count();
             if (cpuElapsed >= 1.0f) {
                 cpuUsage = GetCpuUsage();
-                // Also poll CPU temp
-                if (g_cpuTempAvailable) {
+                // Poll CPU temp - prefer LHWM over WMI
+                if (g_lhwmAvailable && !g_lhwmCpuTempPath.empty()) {
+                    g_cpuTemp = g_lhwmCpuTemp;
+                } else if (g_cpuTempAvailable) {
                     g_cpuTemp = QueryCpuTemperature();
                 }
                 lastCpuTime = now;
@@ -1188,7 +1515,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
             float gpuElapsed = std::chrono::duration<float>(now - lastGpuTime).count();
             if (gpuElapsed >= 1.0f) {
-                PollGpuStats();
+                // Poll LHWM first (covers AMD, Intel, NVIDIA)
+                if (g_lhwmAvailable) {
+                    PollLHWMStats();
+                }
                 lastGpuTime = now;
             }
 
@@ -1327,36 +1657,49 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     ImGui::TextColored(ColorByLoad(cpuUsage), "CPU %.0f%%", cpuUsage);
                     if (g_cpuTempAvailable && g_cpuTemp > 0) {
                         ImGui::SameLine(0, 2);
+                        float dispTemp = ToDisplayTemp(g_cpuTemp, g_Config.useFahrenheit);
                         ImVec4 tc = g_cpuTemp > 85 ? ImVec4(1,.3f,.3f,1)
                                   : g_cpuTemp > 70 ? ImVec4(1,.85f,.15f,1)
                                                    : ImVec4(.70f,.70f,.75f,1);
-                        ImGui::TextColored(tc, " %.0f\xC2\xB0", g_cpuTemp);
+                        ImGui::TextColored(tc, " %.0f\xC2\xB0%s", dispTemp, g_Config.useFahrenheit ? "F" : "C");
                     }
                     needSep = true;
                 }
                 
-                // GPU
+                // GPU stats via LHWM
                 if (g_Config.showGPU) {
                     if (needSep) { ImGui::SameLine(); ImGui::TextColored(ImVec4(.35f,.35f,.40f,1), " | "); ImGui::SameLine(); }
-                    if (g_nvmlOk) {
-                        ImGui::TextColored(ColorByLoad(g_gpuUsage), "GPU %.0f%%", g_gpuUsage);
-                        ImGui::SameLine(0, 2);
-                        ImVec4 tc = g_gpuTemp > 85 ? ImVec4(1,.3f,.3f,1)
-                                  : g_gpuTemp > 70 ? ImVec4(1,.85f,.15f,1)
-                                                   : ImVec4(.70f,.70f,.75f,1);
-                        ImGui::TextColored(tc, " %.0f\xC2\xB0", g_gpuTemp);
+                    
+                    float dispGpuLoad = g_gpuUsage;
+                    float dispGpuTemp = g_gpuTemp;
+                    bool hasGpuData = g_lhwmAvailable && g_gpuCount > 0;
+                    
+                    if (hasGpuData) {
+                        ImGui::TextColored(ColorByLoad(dispGpuLoad), "GPU %.0f%%", dispGpuLoad);
+                        if (dispGpuTemp > 0) {
+                            ImGui::SameLine(0, 2);
+                            float dispTemp = ToDisplayTemp(dispGpuTemp, g_Config.useFahrenheit);
+                            ImVec4 tc = dispGpuTemp > 85 ? ImVec4(1,.3f,.3f,1)
+                                      : dispGpuTemp > 70 ? ImVec4(1,.85f,.15f,1)
+                                                         : ImVec4(.70f,.70f,.75f,1);
+                            ImGui::TextColored(tc, " %.0f\xC2\xB0%s", dispTemp, g_Config.useFahrenheit ? "F" : "C");
+                        }
                     } else {
                         ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "GPU N/A");
                     }
                     needSep = true;
                 }
                 
-                // VRAM (separate section in horizontal view)
-                if (g_Config.showVRAM && g_nvmlOk && g_vramTotal > 0) {
-                    if (needSep) { ImGui::SameLine(); ImGui::TextColored(ImVec4(.35f,.35f,.40f,1), " | "); ImGui::SameLine(); }
-                    float vramPct = (g_vramUsed / g_vramTotal) * 100.0f;
-                    ImGui::TextColored(ColorByLoad(vramPct), "VRAM %.0f%% %.1f/%.0fG", vramPct, g_vramUsed, g_vramTotal);
-                    needSep = true;
+                // VRAM
+                if (g_Config.showVRAM) {
+                    float dispVramUsed = g_vramUsed;
+                    float dispVramTotal = g_vramTotal;
+                    if (dispVramTotal > 0) {
+                        if (needSep) { ImGui::SameLine(); ImGui::TextColored(ImVec4(.35f,.35f,.40f,1), " | "); ImGui::SameLine(); }
+                        float vramPct = (dispVramUsed / dispVramTotal) * 100.0f;
+                        ImGui::TextColored(ColorByLoad(vramPct), "VRAM %.0f%% %.1f/%.0fG", vramPct, dispVramUsed, dispVramTotal);
+                        needSep = true;
+                    }
                 }
                 
                 // RAM
@@ -1409,10 +1752,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     // Show CPU temp if available
                     if (g_cpuTempAvailable && g_cpuTemp > 0) {
                         ImGui::SameLine();
+                        float dispTemp = ToDisplayTemp(g_cpuTemp, g_Config.useFahrenheit);
                         ImVec4 tc = g_cpuTemp > 85 ? ImVec4(1,.3f,.3f,1)
                                   : g_cpuTemp > 70 ? ImVec4(1,.85f,.15f,1)
                                                    : ImVec4(.70f,.70f,.75f,1);
-                        ImGui::TextColored(tc, " %.0f\xC2\xB0""C", g_cpuTemp);
+                        ImGui::TextColored(tc, " %.0f\xC2\xB0%s", dispTemp, g_Config.useFahrenheit ? "F" : "C");
                     }
                     ImGui::SetWindowFontScale(0.82f);
                     ImGui::TextColored(ImVec4(.42f,.42f,.48f,1), "  %s", g_cpuName);
@@ -1420,22 +1764,32 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     needSep = true;
                 }
 
-                // GPU
+                // GPU stats via LHWM
                 if (g_Config.showGPU) {
                     if (needSep) { ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing(); }
-                    if (g_nvmlOk) {
-                        ImGui::TextColored(ColorByLoad(g_gpuUsage), "GPU  %.0f%%", g_gpuUsage);
-                        ImGui::SameLine();
-                        ImVec4 tc = g_gpuTemp > 85 ? ImVec4(1,.3f,.3f,1)
-                                  : g_gpuTemp > 70 ? ImVec4(1,.85f,.15f,1)
-                                                   : ImVec4(.70f,.70f,.75f,1);
-                        ImGui::TextColored(tc, " %.0f\xC2\xB0""C", g_gpuTemp);
+                    
+                    float dispGpuLoad = g_gpuUsage;
+                    float dispGpuTemp = g_gpuTemp;
+                    float dispVramUsed = g_vramUsed;
+                    float dispVramTotal = g_vramTotal;
+                    bool hasGpuData = g_lhwmAvailable && g_gpuCount > 0;
+                    
+                    if (hasGpuData) {
+                        ImGui::TextColored(ColorByLoad(dispGpuLoad), "GPU  %.0f%%", dispGpuLoad);
+                        if (dispGpuTemp > 0) {
+                            ImGui::SameLine();
+                            float dispTemp = ToDisplayTemp(dispGpuTemp, g_Config.useFahrenheit);
+                            ImVec4 tc = dispGpuTemp > 85 ? ImVec4(1,.3f,.3f,1)
+                                      : dispGpuTemp > 70 ? ImVec4(1,.85f,.15f,1)
+                                                         : ImVec4(.70f,.70f,.75f,1);
+                            ImGui::TextColored(tc, " %.0f\xC2\xB0%s", dispTemp, g_Config.useFahrenheit ? "F" : "C");
+                        }
                         // VRAM usage
-                        if (g_Config.showVRAM && g_vramTotal > 0) {
-                            float vramPct = (g_vramUsed / g_vramTotal) * 100.0f;
+                        if (g_Config.showVRAM && dispVramTotal > 0) {
+                            float vramPct = (dispVramUsed / dispVramTotal) * 100.0f;
                             ImGui::TextColored(ColorByLoad(vramPct), "VRAM %.0f%%", vramPct);
                             ImGui::SameLine();
-                            ImGui::TextColored(ImVec4(.70f,.70f,.75f,1), " %.1f / %.0f GB", g_vramUsed, g_vramTotal);
+                            ImGui::TextColored(ImVec4(.70f,.70f,.75f,1), " %.1f / %.0f GB", dispVramUsed, dispVramTotal);
                         }
                     } else {
                         ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "GPU  N/A");
@@ -1472,6 +1826,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     }
 
     // ═══ Cleanup ═══
+    SaveConfig(g_Config);  // Save settings before exit
     StopEtwSession();
     if (g_Mode == MODE_OVERLAY) RemoveTrayIcon();
     ImGui_ImplDX11_Shutdown();
@@ -1480,7 +1835,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     CleanupDeviceD3D();
     DestroyWindow(g_hwnd);
     UnregisterClass("FPSOverlay", g_hInstance);
-    ShutdownNvml();
     ShutdownWMI();
 
     return 0;
