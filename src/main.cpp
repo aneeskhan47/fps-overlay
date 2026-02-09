@@ -1294,7 +1294,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::SetWindowFontScale(1.4f);
             ImGui::TextColored(ImVec4(.35f,.78f,1,1), "FPS Overlay");
             ImGui::SetWindowFontScale(1.0f);
-            ImGui::SameLine(); ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " Beta v1.1.0");
+            ImGui::SameLine(); ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " Beta v1.2.0");
 
             // Developer text
             ImGui::Spacing();
@@ -1311,7 +1311,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 ImGui::SameLine();
                 ImGui::TextColored(ImVec4(.9f,.4f,.2f,1), "(needs admin!)");
             }
-            ImGui::Checkbox("  CPU Usage", &g_Config.showCPU);
+            ImGui::Checkbox("  CPU Usage & Temp", &g_Config.showCPU);
             ImGui::Checkbox("  GPU Usage & Temp", &g_Config.showGPU);
             if (!g_lhwmAvailable || g_gpuCount == 0) {
                 ImGui::SameLine();
