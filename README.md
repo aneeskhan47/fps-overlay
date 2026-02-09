@@ -20,6 +20,9 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 
 ## Screenshot
 
+<img width="1918" height="1198" alt="2026-02-08_16-22" src="https://github.com/user-attachments/assets/b6d3ef8b-1ccb-439b-8c66-37f80f6c2b0e" />
+
+
 <!-- Add your screenshot here -->
 <!-- ![FPS Overlay Screenshot](screenshot.png) -->
 
