@@ -1,0 +1,95 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Build outputs
+# ══════════════════════════════════════════════════════════════════════════════
+*.exe
+*.dll
+*.so
+*.dylib
+*.out
+
+# Object files
+*.o
+*.obj
+*.lo
+*.slo
+
+# Precompiled headers
+*.gch
+*.pch
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IDE / Editor files
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.vcxproj.filters
+*.VC.db
+*.VC.VC.opendb
+Debug/
+Release/
+x64/
+x86/
+ipch/
+
+# Visual Studio Code
+.vscode/
+
+# JetBrains (CLion)
+.idea/
+cmake-build-*/
+
+# Qt Creator
+*.pro.user
+*.pro.user.*
+
+# Cursor
+.cursor/
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Build systems
+# ══════════════════════════════════════════════════════════════════════════════
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+compile_commands.json
+build/
+out/
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OS generated files
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+.nfs*
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Project-specific
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Build output folder
+/build/
+
+# Log files
+*.log
