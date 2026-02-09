@@ -9,17 +9,20 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 ## Features
 
 - **FPS** — Real game framerate via Windows ETW (same method the pros use)
-- **GPU** — Usage & temperature (NVIDIA via NVML, with fallback for others)
+- **GPU** — Usage & temperature (supports NVIDIA, AMD, and Intel via LibreHardwareMonitor)
+- **Multi-GPU Support** — Detect and select which GPU to monitor from settings
 - **VRAM** — GPU memory usage percentage and used/total GB
 - **CPU** — Usage & temperature
 - **RAM** — Usage percentage and used/total GB
+- **Temperature Units** — Toggle between Celsius and Fahrenheit
 - **Process tracking** — Shows which game/app is being monitored
 - **Horizontal or vertical layout** — Your choice
+- **Persistent Settings** — All preferences saved automatically
 - **Fully click-through** — Never interferes with your game
 - **Custom hotkeys** — Bind toggle/exit to whatever you want
 - **System tray integration** — Stays out of your way
 - **Hold CTRL to drag** — Position it exactly where you want with visual feedback
-- **4MB single .exe** — No installer, no background services, no bloat
+- **Lightweight** — No installer, no background services, no bloat
 
 ## Screenshot
 
@@ -112,24 +115,24 @@ The tradeoff is that ETW requires admin because it's a system-wide kernel tracin
 ### Requirements
 
 - Windows 10/11
-- MinGW-w64 (g++ with C++20 support)
-- Make (mingw32-make)
+- Visual Studio 2022+ Build Tools (with C++ workload)
 
 ### Build
 
 ```bash
 git clone https://github.com/aneeskhan47/fps-overlay.git
 cd fps-overlay
-mingw32-make
+build-msvc.bat
 ```
 
-The output is `overlay.exe` in the project root.
+The output is `build\overlay.exe` along with required DLLs.
 
 ### Dependencies (included)
 
 - [Dear ImGui](https://github.com/ocornut/imgui) — Immediate mode GUI
+- [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) — Cross-vendor hardware monitoring
+- [lhwm-cpp-wrapper](https://gitlab.com/OpenRGBDevelopers/lhwm-wrapper) — C++ wrapper for LibreHardwareMonitor
 - DirectX 11 SDK (Windows SDK)
-- NVML headers (for NVIDIA GPU stats)
 
 ## Project Structure
 
@@ -139,20 +142,28 @@ fps-overlay/
 │   ├── main.cpp        # All application code
 │   └── resource.rc     # Windows resources (icon, version info)
 ├── libs/
-│   └── imgui/          # Dear ImGui library
+│   ├── imgui/          # Dear ImGui library
+│   └── lhwm/           # LibreHardwareMonitor wrapper
+├── build/              # Build output
+│   ├── overlay.exe
+│   ├── lhwm-wrapper.dll
+│   ├── LibreHardwareMonitorLib.dll
+│   └── config.ini      # Settings (created on first run)
 ├── icon.ico            # Application icon
-├── Makefile            # Build configuration
+├── build-msvc.bat      # Build script
+├── FPSOverlay.vcxproj  # Visual Studio project
 └── README.md
 ```
 
 ## Tech Stack
 
 - **Language:** C++20
+- **Build:** MSVC (Visual Studio Build Tools)
 - **Graphics:** DirectX 11
 - **UI:** Dear ImGui
 - **FPS Tracking:** Windows ETW (Event Tracing for Windows)
-- **GPU Stats:** NVML (NVIDIA Management Library)
-- **CPU Temp:** WMI (Windows Management Instrumentation)
+- **GPU Stats:** LibreHardwareMonitor (supports NVIDIA, AMD, Intel)
+- **CPU Temp:** LibreHardwareMonitor / WMI fallback
 - **Windowing:** Win32 API (layered transparent window)
 
 ## License
@@ -161,7 +172,7 @@ GNU General Public License v3.0 - see [LICENSE.txt](LICENSE.txt) for details.
 
 ## Contributing
 
-Found a bug? Want to add AMD GPU support? PRs welcome.
+Found a bug? Have a feature request? PRs welcome.
 
 ---
 
