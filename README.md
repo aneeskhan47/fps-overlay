@@ -78,10 +78,6 @@ Or build it yourself (see below).
 | Toggle visibility | Your configured hotkey (default: **Insert**) |
 | Exit | Your configured hotkey (default: **End**) |
 
-### Without Admin
-
-The overlay works without admin too — you just won't get game FPS, only system stats (CPU, GPU, RAM).
-
 ## Why ETW? Why Admin?
 
 There are basically 3 ways to get real game FPS:
