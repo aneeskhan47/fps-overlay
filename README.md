@@ -2,7 +2,7 @@
 
 A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while gaming — nothing else.
 
-![Size](https://img.shields.io/badge/size-~4MB-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![License](https://img.shields.io/badge/license-GNU%20GPLv3-green) ![Status](https://img.shields.io/badge/status-beta-orange)
+![Size](https://img.shields.io/badge/size-~6MB-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![License](https://img.shields.io/badge/license-GNU%20GPLv3-green) ![Status](https://img.shields.io/badge/status-beta-orange)
 
 > **⚠️ Beta Software:** This project is currently in beta and under active development. Features, UI, and behavior are subject to change. Feedback and bug reports are welcome!
 
@@ -51,7 +51,7 @@ I wanted a simple FPS overlay. That's it. Just FPS, CPU, GPU, RAM stats on my sc
 
 ### So I built my own:
 
-- **4MB total** — Single .exe, no installer, no background services
+- **~6MB total** — Single .exe, no installer, no background services
 - **C++ with DirectX 11 + Dear ImGui** — As lightweight as it gets
 - **No account required. No telemetry. No "gaming optimization" features. No social integration. No ads. Just stats.**
 
