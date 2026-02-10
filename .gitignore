@@ -93,3 +93,8 @@ $RECYCLE.BIN/
 
 # Log files
 *.log
+
+# Include lhwm DLLs (override *.dll ignore)
+!libs/lhwm/*.dll
+
+!libs/lhwm/*.exe

@@ -2,11 +2,15 @@
 // IDI_ICON1 must be 1 to be the default app icon
 1 ICON "../icon.ico"
 
+// PawnIO setup executable (kernel driver installer for LibreHardwareMonitor)
+// Resource type RCDATA (raw binary data), ID 101
+101 RCDATA "../libs/lhwm/PawnIO_setup.exe"
+
 // Version information
 #include <winver.h>
 
 #define VER_MAJOR 1
-#define VER_MINOR 2
+#define VER_MINOR 3
 #define VER_PATCH 0
 #define VER_BUILD 0
 
