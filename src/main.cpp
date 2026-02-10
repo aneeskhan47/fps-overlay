@@ -48,6 +48,9 @@
 #define IDM_SHOW      1003
 #define IDM_HIDE      1004
 
+// PawnIO installer resource ID (embedded executable)
+#define IDR_PAWNIO_SETUP 101
+
 #ifndef PROCESS_TRACE_MODE_EVENT_RECORD
 #define PROCESS_TRACE_MODE_EVENT_RECORD 0x10000000
 #endif
@@ -196,6 +199,44 @@ static void LoadConfig(OverlayConfig& cfg)
     if (cfg.opacity < 30) cfg.opacity = 30;
     if (cfg.opacity > 100) cfg.opacity = 100;
     if (cfg.selectedGpu < 0) cfg.selectedGpu = 0;
+}
+
+// Check if welcome message has been shown (separate from config)
+static bool HasWelcomeBeenShown()
+{
+    InitConfigPath();
+    return ReadIniInt("App", "welcomeShown", 0) != 0;
+}
+
+static void MarkWelcomeShown()
+{
+    InitConfigPath();
+    WriteIniInt("App", "welcomeShown", 1);
+}
+
+// Show welcome message on first run
+static void ShowWelcomeMessage()
+{
+    if (HasWelcomeBeenShown()) {
+        return;  // Already shown before
+    }
+    
+    MessageBoxA(
+        nullptr,
+        "Welcome to FPS Overlay!\n\n"
+        "For the best experience, it is recommended to disable other FPS overlays:\n\n"
+        "  - Steam Overlay (Steam > Settings > In-Game)\n"
+        "  - Xbox Game Bar (Windows Settings > Gaming)\n"
+        "  - NVIDIA GeForce Experience Overlay/NVIDIA ShadowPlay/NVIDIA App\n"
+        "  - AMD Radeon Software Overlay\n"
+        "  - Discord Overlay\n\n"
+        "This prevents conflicts and ensures accurate FPS readings.\n\n"
+        "Enjoy!",
+        "FPS Overlay",
+        MB_OK | MB_ICONINFORMATION | MB_TOPMOST
+    );
+    
+    MarkWelcomeShown();
 }
 
 static void SaveConfig(const OverlayConfig& cfg)
@@ -580,6 +621,153 @@ static float QueryCpuTemperature()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PawnIO Driver Installation — Required for CPU temperature access
+// ═══════════════════════════════════════════════════════════════════════════
+static bool g_pawnIOPromptShown = false;  // Only show prompt once per session
+
+// Check if PawnIO driver is installed via registry
+// LibreHardwareMonitor checks: SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO
+static bool IsPawnIOInstalled()
+{
+    HKEY hKey = nullptr;
+    
+    // Try native registry first (64-bit on 64-bit Windows, 32-bit on 32-bit Windows)
+    LONG result = RegOpenKeyExA(
+        HKEY_LOCAL_MACHINE,
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PawnIO",
+        0, KEY_READ, &hKey
+    );
+    
+    if (result == ERROR_SUCCESS) {
+        // Check if DisplayVersion exists
+        char versionStr[64] = {0};
+        DWORD size = sizeof(versionStr);
+        DWORD type = REG_SZ;
+        result = RegQueryValueExA(hKey, "DisplayVersion", nullptr, &type, 
+                                  reinterpret_cast<LPBYTE>(versionStr), &size);
+        RegCloseKey(hKey);
+        
+        if (result == ERROR_SUCCESS && versionStr[0] != '\0') {
+            return true;
+        }
+    }
+    
+    // Try 64-bit registry view explicitly (for 32-bit apps on 64-bit Windows)
+    result = RegOpenKeyExA(
+        HKEY_LOCAL_MACHINE,
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PawnIO",
+        0, KEY_READ | KEY_WOW64_64KEY, &hKey
+    );
+    
+    if (result == ERROR_SUCCESS) {
+        char versionStr[64] = {0};
+        DWORD size = sizeof(versionStr);
+        DWORD type = REG_SZ;
+        result = RegQueryValueExA(hKey, "DisplayVersion", nullptr, &type,
+                                  reinterpret_cast<LPBYTE>(versionStr), &size);
+        RegCloseKey(hKey);
+        
+        if (result == ERROR_SUCCESS && versionStr[0] != '\0') {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+// Extract embedded PawnIO_setup.exe and run it
+static bool ExtractAndRunPawnIOSetup()
+{
+    HMODULE hModule = GetModuleHandle(nullptr);
+    HRSRC hResource = FindResource(hModule, MAKEINTRESOURCE(IDR_PAWNIO_SETUP), RT_RCDATA);
+    if (!hResource) {
+        return false;
+    }
+    
+    HGLOBAL hLoadedResource = LoadResource(hModule, hResource);
+    if (!hLoadedResource) {
+        return false;
+    }
+    
+    LPVOID pResourceData = LockResource(hLoadedResource);
+    DWORD dwResourceSize = SizeofResource(hModule, hResource);
+    if (!pResourceData || dwResourceSize == 0) {
+        return false;
+    }
+    
+    // Get temp directory and create path for the installer
+    char tempPath[MAX_PATH];
+    char tempFile[MAX_PATH];
+    GetTempPathA(MAX_PATH, tempPath);
+    snprintf(tempFile, MAX_PATH, "%sPawnIO_setup.exe", tempPath);
+    
+    // Write the resource to a temp file
+    HANDLE hFile = CreateFileA(tempFile, GENERIC_WRITE, 0, nullptr, 
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    
+    DWORD bytesWritten;
+    BOOL writeResult = WriteFile(hFile, pResourceData, dwResourceSize, &bytesWritten, nullptr);
+    CloseHandle(hFile);
+    
+    if (!writeResult || bytesWritten != dwResourceSize) {
+        DeleteFileA(tempFile);
+        return false;
+    }
+    
+    // Run the installer silently with -install flag and wait for it to complete
+    SHELLEXECUTEINFOA sei = { sizeof(sei) };
+    sei.lpVerb = "runas";  // Request elevation
+    sei.lpFile = tempFile;
+    sei.lpParameters = "-install";  // Silent install flag
+    sei.nShow = SW_HIDE;  // Hide the installer window
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    
+    if (ShellExecuteExA(&sei)) {
+        // Wait for the installer to finish
+        if (sei.hProcess) {
+            WaitForSingleObject(sei.hProcess, INFINITE);
+            CloseHandle(sei.hProcess);
+        }
+        
+        // Clean up temp file
+        DeleteFileA(tempFile);
+        return true;
+    }
+    
+    DeleteFileA(tempFile);
+    return false;
+}
+
+// Show prompt to install PawnIO driver
+static bool PromptAndInstallPawnIO()
+{
+    if (g_pawnIOPromptShown) {
+        return false;  // Already prompted this session
+    }
+    g_pawnIOPromptShown = true;
+    
+    int result = MessageBoxA(
+        nullptr,
+        "PawnIO driver is not installed.\n\n"
+        "This driver is required for LibreHardwareMonitor to correctly read "
+        "CPU and GPU temperatures on modern systems.\n\n"
+        "Would you like to install it now?\n\n"
+        "(You may need to restart FPS Overlay after installation)",
+        "FPS Overlay - Driver Required",
+        MB_YESNO | MB_ICONQUESTION | MB_TOPMOST
+    );
+    
+    if (result == IDYES) {
+        return ExtractAndRunPawnIOSetup();
+    }
+    
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // LibreHardwareMonitor (LHWM) — cross-vendor hardware monitoring
 // ═══════════════════════════════════════════════════════════════════════════
 // Helper to check if a hardware name is a GPU (excluding integrated graphics)
@@ -651,11 +839,18 @@ static bool InitLHWM()
             // If this is a discrete GPU, find or create entry in GPU list
             int gpuIndex = -1;
             if (isDiscreteGpuHardware && g_gpuCount < MAX_GPUS) {
-                gpuIndex = FindGpuByName(hardwareName.c_str());
+                // Clean the hardware name - LHWM may return "Name : /path", we only want the name
+                std::string cleanName = hardwareName;
+                size_t colonPos = cleanName.find(" : ");
+                if (colonPos != std::string::npos) {
+                    cleanName = cleanName.substr(0, colonPos);
+                }
+                
+                gpuIndex = FindGpuByName(cleanName.c_str());
                 if (gpuIndex < 0) {
                     // New GPU - add to list
                     gpuIndex = g_gpuCount;
-                    snprintf(g_gpuList[gpuIndex].name, sizeof(g_gpuList[gpuIndex].name), "%s", hardwareName.c_str());
+                    snprintf(g_gpuList[gpuIndex].name, sizeof(g_gpuList[gpuIndex].name), "%s", cleanName.c_str());
                     g_gpuList[gpuIndex].tempPath.clear();
                     g_gpuList[gpuIndex].loadPath.clear();
                     g_gpuList[gpuIndex].vramUsedPath.clear();
@@ -684,12 +879,15 @@ static bool InitLHWM()
                 
                 // CPU temperature sensors
                 if ((isCpuHardware || isCpuPath) && sensorType == "Temperature") {
-                    // Prefer Package, Tctl/Tdie, or Core temps
-                    if (sensorName.find("Package") != std::string::npos ||
-                        sensorName.find("Tctl") != std::string::npos ||
-                        sensorName.find("Tdie") != std::string::npos ||
-                        sensorName.find("Core (Tctl/Tdie)") != std::string::npos) {
-                        g_lhwmCpuTempPath = sensorPath;
+                    // Priority order for CPU temp (matching Task Manager):
+                    // 1. "Soc" - AMD SoC temperature (most accurate for overall CPU temp)
+                    // 2. "Package" - Intel package temp
+                    // 3. Fallback to any other CPU temp
+                    if (sensorName == "Soc" || sensorName.find("Soc") != std::string::npos) {
+                        g_lhwmCpuTempPath = sensorPath;  // Best choice for AMD
+                    } else if (g_lhwmCpuTempPath.empty() && 
+                               sensorName.find("Package") != std::string::npos) {
+                        g_lhwmCpuTempPath = sensorPath;  // Best choice for Intel
                     } else if (g_lhwmCpuTempPath.empty()) {
                         cpuTempFallback = sensorPath;
                     }
@@ -698,10 +896,16 @@ static bool InitLHWM()
                 // GPU sensors - store in the GPU's entry
                 if (gpuIndex >= 0) {
                     if (sensorType == "Temperature") {
-                        if (sensorName.find("Core") != std::string::npos || 
-                            sensorName.find("GPU") != std::string::npos ||
-                            g_gpuList[gpuIndex].tempPath.empty()) {
-                            g_gpuList[gpuIndex].tempPath = sensorPath;
+                        // Prefer "GPU Core" exactly, avoid "Hot Spot" (matches Task Manager)
+                        bool isHotSpot = (sensorName.find("Hot Spot") != std::string::npos ||
+                                          sensorName.find("Hotspot") != std::string::npos);
+                        bool isGpuCore = (sensorName == "GPU Core" || 
+                                          sensorName.find("GPU Core") != std::string::npos);
+                        
+                        if (isGpuCore && !isHotSpot) {
+                            g_gpuList[gpuIndex].tempPath = sensorPath;  // Best choice
+                        } else if (g_gpuList[gpuIndex].tempPath.empty() && !isHotSpot) {
+                            g_gpuList[gpuIndex].tempPath = sensorPath;  // Fallback (not hotspot)
                         }
                     }
                     else if (sensorType == "Load") {
@@ -1160,6 +1364,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     // ── Load saved configuration ──
     LoadConfig(g_Config);
 
+    // ── Show welcome message on first run ──
+    ShowWelcomeMessage();
+
     // ── Query hardware ──
     QueryCpuName();
 
@@ -1196,6 +1403,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     // Get GPU name from DXGI adapter (fallback if LHWM doesn't provide it)
     QueryGpuName();
 
+    // Check if PawnIO driver is installed (required for temperature access on modern systems)
+    // This check happens before LHWM init so user can install it first
+    if (!IsPawnIOInstalled()) {
+        if (PromptAndInstallPawnIO()) {
+            // Driver was installed, continue with initialization
+        }
+        // If user declined, we still try to initialize - some features may work
+    }
+    
     // Initialize LibreHardwareMonitor for GPU and CPU temperature monitoring
     // Supports NVIDIA, AMD, and Intel GPUs
     g_lhwmAvailable = InitLHWM();
@@ -1294,7 +1510,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::SetWindowFontScale(1.4f);
             ImGui::TextColored(ImVec4(.35f,.78f,1,1), "FPS Overlay");
             ImGui::SetWindowFontScale(1.0f);
-            ImGui::SameLine(); ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " Beta v1.2.0");
+            ImGui::SameLine(); ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " Beta v1.3.0");
 
             // Developer text
             ImGui::Spacing();

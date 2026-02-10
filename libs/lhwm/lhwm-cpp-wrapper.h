@@ -14,7 +14,6 @@ class LHWM
 public:
 	static std::map<std::string, std::vector<std::tuple<std::string, std::string, std::string>>> GetHardwareSensorMap();
 	static float GetSensorValue(std::string identifier);
-	static void SetControlValue(std::string identifier, float value);
 };
 
 #endif // LHWM_CPP_WRAPPER_H
