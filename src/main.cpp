@@ -83,10 +83,9 @@ static const ULONGLONG DXGKRNL_KEYWORD_PRESENT = 0x8000000;  // Present keyword
 static const ULONGLONG DXGKRNL_KEYWORD_BASE    = 0x1;        // Base keyword
 
 // DxgKrnl event IDs for present tracking
-static const USHORT DXGKRNL_EVENT_PRESENT_INFO      = 0x00B8;  // Present::Info (184)
-static const USHORT DXGKRNL_EVENT_QUEUEPACKET_START = 0x00B2;  // QueuePacket::Start (178)
-static const USHORT DXGKRNL_EVENT_FLIP_INFO         = 0x00A8;  // Flip::Info (168)
-static const USHORT DXGKRNL_EVENT_BLIT_INFO         = 0x00A6;  // Blit::Info (166)
+static const USHORT DXGKRNL_EVENT_PRESENT_INFO = 0x00B8;  // Present::Info (184)
+static const USHORT DXGKRNL_EVENT_FLIP_INFO    = 0x00A8;  // Flip::Info (168)
+static const USHORT DXGKRNL_EVENT_BLIT_INFO    = 0x00A6;  // Blit::Info (166)
 
 static const char* ETW_SESSION_NAME = "FPSOverlay_ETW";
 
@@ -324,31 +323,6 @@ static bool               g_etwAvailable = false;
 static bool               g_isAdmin = false;      // running as administrator?
 static double              g_qpcFreq     = 1.0;
 static char               g_targetProcessName[128] = "";  // current tracked process name
-
-// Graphics API detection state
-enum class GraphicsAPI {
-    Unknown = 0,
-    DirectX9,
-    DirectX10,
-    DirectX11,
-    DirectX12,
-    Vulkan,
-    OpenGL
-};
-static std::atomic<GraphicsAPI> g_detectedAPI{GraphicsAPI::Unknown};
-
-// Get display string for detected Graphics API
-static const char* GetGraphicsAPIString(GraphicsAPI api) {
-    switch (api) {
-        case GraphicsAPI::DirectX9:  return "DirectX 9";
-        case GraphicsAPI::DirectX10: return "DirectX";
-        case GraphicsAPI::DirectX11: return "DirectX";
-        case GraphicsAPI::DirectX12: return "DirectX";
-        case GraphicsAPI::Vulkan:    return "Vulkan";
-        case GraphicsAPI::OpenGL:    return "OpenGL";
-        default:                     return nullptr;
-    }
-}
 
 // ── CPU temperature (WMI) ──
 static float g_cpuTemp = 0.0f;
@@ -1116,7 +1090,6 @@ static void WINAPI EtwCallback(PEVENT_RECORD pEvent)
 
     // Simple 1-second accumulator (all on the ETW thread — no lock needed)
     static DWORD s_lastPid   = 0;
-    static int   s_count     = 0;
     static double s_startTs  = 0;
     static int   s_dxgiCount = 0;      // Count of DXGI events (DirectX 10/11/12)
     static int   s_d3d9Count = 0;      // Count of D3D9 events
@@ -1124,41 +1097,58 @@ static void WINAPI EtwCallback(PEVENT_RECORD pEvent)
 
     if (pid != s_lastPid) { 
         s_lastPid = pid; 
-        s_count = 0; 
         s_dxgiCount = 0;
         s_d3d9Count = 0;
         s_dxgKrnlCount = 0;
         s_startTs = ts; 
-        g_detectedAPI.store(GraphicsAPI::Unknown, std::memory_order_relaxed);
         return; 
     }
 
-    s_count++;
+    // Count events by source
     if (isDxgiEvent) s_dxgiCount++;
     if (isD3D9Event) s_d3d9Count++;
     if (isDxgKrnlOnlyEvent) s_dxgKrnlCount++;
     
     double elapsed = ts - s_startTs;
     if (elapsed >= 1.0) {
-        g_gameFps.store((float)s_count / (float)elapsed, std::memory_order_relaxed);
+        // Prioritize DXGI/D3D9 (explicit game API calls) over DxgKrnl (kernel-level)
+        // This filters out desktop apps like explorer.exe that only show up in DxgKrnl
+        //
+        // Priority:
+        // 1. D3D9 events = DirectX 9 game
+        // 2. DXGI events = DirectX 10/11/12 game  
+        // 3. ONLY if no DXGI/D3D9 events, use DxgKrnl = Vulkan/OpenGL game
+        //
+        // Desktop apps (explorer, terminals, browsers) go through DWM which uses DxgKrnl,
+        // but they don't call DXGI/D3D9 Present directly, so they get filtered out.
         
-        // Determine graphics API based on event source priority:
-        // 1. D3D9 provider = DirectX 9
-        // 2. DXGI provider = DirectX 10/11/12
-        // 3. Only DxgKrnl events = Vulkan or OpenGL (most modern games = Vulkan)
+        int frameCount = 0;
+        
         if (s_d3d9Count > 0) {
-            g_detectedAPI.store(GraphicsAPI::DirectX9, std::memory_order_relaxed);
+            // DirectX 9 game - use D3D9 count
+            frameCount = s_d3d9Count;
         } else if (s_dxgiCount > 0) {
-            // DXGI events = DirectX 10/11/12
-            // Report as "DirectX" - version detection would require deeper analysis
-            g_detectedAPI.store(GraphicsAPI::DirectX11, std::memory_order_relaxed);
+            // DirectX 10/11/12 game - use DXGI count
+            frameCount = s_dxgiCount;
         } else if (s_dxgKrnlCount > 0) {
-            // Only DxgKrnl events, no DXGI or D3D9 = Vulkan or OpenGL
-            // Most modern games using this path are Vulkan
-            g_detectedAPI.store(GraphicsAPI::Vulkan, std::memory_order_relaxed);
+            // No DXGI/D3D9 events, only DxgKrnl
+            // This could be Vulkan/OpenGL OR a desktop app through DWM
+            // 
+            // Filter: Only count as a game if FPS >= 20
+            // Real games render at 20+ FPS, desktop apps typically < 20 FPS
+            float potentialFps = (float)s_dxgKrnlCount / (float)elapsed;
+            if (potentialFps >= 20.0f) {
+                frameCount = s_dxgKrnlCount;
+            }
+            // If < 20 FPS, treat as desktop app (frameCount stays 0)
         }
         
-        s_count = 0;
+        if (frameCount > 0) {
+            g_gameFps.store((float)frameCount / (float)elapsed, std::memory_order_relaxed);
+        } else {
+            g_gameFps.store(0.0f, std::memory_order_relaxed);
+        }
+        
         s_dxgiCount = 0;
         s_d3d9Count = 0;
         s_dxgKrnlCount = 0;
@@ -1822,7 +1812,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             // ── Reset FPS when target app changes or closes ──
             if (currentPid != g_lastTargetPid) {
                 g_gameFps.store(0.0f, std::memory_order_relaxed);
-                g_detectedAPI.store(GraphicsAPI::Unknown, std::memory_order_relaxed);
                 g_lastTargetPid = currentPid;
                 // Update process name
                 GetProcessName(currentPid, g_targetProcessName, sizeof(g_targetProcessName));
@@ -2055,16 +2044,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     ImGui::TextColored(ColorByLoad(pct), "RAM %.0f%% %.1f/%.0fG", pct, ramUsed, ramTotal);
                 }
                 
-                // Process name and Graphics API on second line (compact)
+                // Process name on second line (compact)
                 if (g_Config.showFPS && g_targetProcessName[0]) {
                     ImGui::SetWindowFontScale(0.78f);
-                    // Show Graphics API if detected
-                    const char* apiStr = GetGraphicsAPIString(g_detectedAPI.load(std::memory_order_relaxed));
-                    if (apiStr) {
-                        ImGui::TextColored(ImVec4(.42f,.52f,.42f,1), "%s | %s", g_targetProcessName, apiStr);
-                    } else {
-                        ImGui::TextColored(ImVec4(.42f,.52f,.42f,1), "%s", g_targetProcessName);
-                    }
+                    ImGui::TextColored(ImVec4(.42f,.52f,.42f,1), "%s", g_targetProcessName);
                     ImGui::SetWindowFontScale(1.0f);
                 }
             }
@@ -2088,11 +2071,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     if (g_targetProcessName[0]) {
                         ImGui::SetWindowFontScale(0.82f);
                         ImGui::TextColored(ImVec4(.42f,.55f,.42f,1), "  %s", g_targetProcessName);
-                        // Show Graphics API on separate line
-                        const char* apiStr = GetGraphicsAPIString(g_detectedAPI.load(std::memory_order_relaxed));
-                        if (apiStr) {
-                            ImGui::TextColored(ImVec4(.55f,.55f,.75f,1), "  Graphics API: %s", apiStr);
-                        }
                         ImGui::SetWindowFontScale(1.0f);
                     } else {
                         ImGui::SetWindowFontScale(0.82f);
