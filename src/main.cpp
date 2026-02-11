@@ -1,7 +1,8 @@
 // FPS Overlay — Lightweight DirectX 11 + ImGui performance monitor
 //
 // Features:
-//   - Real game FPS via ETW (Event Tracing for Windows — hooks DXGI Present)
+//   - Real game FPS via ETW (Event Tracing for Windows)
+//     Supports: DirectX 9/10/11/12, Vulkan, OpenGL via DXGI + DxgKrnl providers
 //   - GPU usage & temperature via LibreHardwareMonitor (supports NVIDIA, AMD, Intel)
 //   - CPU / RAM monitoring
 //   - Hardware names (CPU model, GPU model)
@@ -67,6 +68,25 @@
 // Microsoft-Windows-DXGI provider  {CA11C036-0102-4A2D-A6AD-F03CFED5D3C9}
 static const GUID DXGI_PROVIDER =
     { 0xCA11C036, 0x0102, 0x4A2D, { 0xA6, 0xAD, 0xF0, 0x3C, 0xFE, 0xD5, 0xD3, 0xC9 } };
+
+// Microsoft-Windows-D3D9 provider  {783ACA0A-790E-4D7F-8451-AA850511C6B9}
+static const GUID D3D9_PROVIDER =
+    { 0x783ACA0A, 0x790E, 0x4D7F, { 0x84, 0x51, 0xAA, 0x85, 0x05, 0x11, 0xC6, 0xB9 } };
+
+// Microsoft-Windows-DxgKrnl provider  {802EC45A-1E99-4B83-9920-87C98277BA9D}
+// This captures presents at the kernel level for ALL graphics APIs: DX9/10/11/12, Vulkan, OpenGL
+static const GUID DXGKRNL_PROVIDER =
+    { 0x802EC45A, 0x1E99, 0x4B83, { 0x99, 0x20, 0x87, 0xC9, 0x82, 0x77, 0xBA, 0x9D } };
+
+// DxgKrnl keywords for Present tracking
+static const ULONGLONG DXGKRNL_KEYWORD_PRESENT = 0x8000000;  // Present keyword
+static const ULONGLONG DXGKRNL_KEYWORD_BASE    = 0x1;        // Base keyword
+
+// DxgKrnl event IDs for present tracking
+static const USHORT DXGKRNL_EVENT_PRESENT_INFO      = 0x00B8;  // Present::Info (184)
+static const USHORT DXGKRNL_EVENT_QUEUEPACKET_START = 0x00B2;  // QueuePacket::Start (178)
+static const USHORT DXGKRNL_EVENT_FLIP_INFO         = 0x00A8;  // Flip::Info (168)
+static const USHORT DXGKRNL_EVENT_BLIT_INFO         = 0x00A6;  // Blit::Info (166)
 
 static const char* ETW_SESSION_NAME = "FPSOverlay_ETW";
 
@@ -304,6 +324,31 @@ static bool               g_etwAvailable = false;
 static bool               g_isAdmin = false;      // running as administrator?
 static double              g_qpcFreq     = 1.0;
 static char               g_targetProcessName[128] = "";  // current tracked process name
+
+// Graphics API detection state
+enum class GraphicsAPI {
+    Unknown = 0,
+    DirectX9,
+    DirectX10,
+    DirectX11,
+    DirectX12,
+    Vulkan,
+    OpenGL
+};
+static std::atomic<GraphicsAPI> g_detectedAPI{GraphicsAPI::Unknown};
+
+// Get display string for detected Graphics API
+static const char* GetGraphicsAPIString(GraphicsAPI api) {
+    switch (api) {
+        case GraphicsAPI::DirectX9:  return "DirectX 9";
+        case GraphicsAPI::DirectX10: return "DirectX";
+        case GraphicsAPI::DirectX11: return "DirectX";
+        case GraphicsAPI::DirectX12: return "DirectX";
+        case GraphicsAPI::Vulkan:    return "Vulkan";
+        case GraphicsAPI::OpenGL:    return "OpenGL";
+        default:                     return nullptr;
+    }
+}
 
 // ── CPU temperature (WMI) ──
 static float g_cpuTemp = 0.0f;
@@ -1030,13 +1075,42 @@ static void WINAPI EtwCallback(PEVENT_RECORD pEvent)
 {
     if (!g_etwRunning.load(std::memory_order_relaxed)) return;
 
-    // Only DXGI Present::Start (Event ID 42)
-    if (memcmp(&pEvent->EventHeader.ProviderId, &DXGI_PROVIDER, sizeof(GUID)) != 0) return;
-    if (pEvent->EventHeader.EventDescriptor.Id != 42) return;
-
     DWORD pid = pEvent->EventHeader.ProcessId;
     DWORD target = g_targetPid.load(std::memory_order_relaxed);
     if (target == 0 || pid != target) return;
+
+    bool isValidPresentEvent = false;
+    bool isDxgiEvent = false;
+    bool isD3D9Event = false;
+    bool isDxgKrnlOnlyEvent = false;
+    
+    // Check for DXGI Present::Start (Event ID 42) - DirectX 10/11/12
+    if (memcmp(&pEvent->EventHeader.ProviderId, &DXGI_PROVIDER, sizeof(GUID)) == 0) {
+        if (pEvent->EventHeader.EventDescriptor.Id == 42) {
+            isValidPresentEvent = true;
+            isDxgiEvent = true;
+        }
+    }
+    // Check for D3D9 Present events (Event ID 1 = Present::Start)
+    else if (memcmp(&pEvent->EventHeader.ProviderId, &D3D9_PROVIDER, sizeof(GUID)) == 0) {
+        if (pEvent->EventHeader.EventDescriptor.Id == 1) {
+            isValidPresentEvent = true;
+            isD3D9Event = true;
+        }
+    }
+    // Check for DxgKrnl events - captures Vulkan, OpenGL, and all other graphics APIs at kernel level
+    else if (memcmp(&pEvent->EventHeader.ProviderId, &DXGKRNL_PROVIDER, sizeof(GUID)) == 0) {
+        USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
+        // Present::Info, Flip::Info, or Blit::Info events indicate a frame present
+        if (eventId == DXGKRNL_EVENT_PRESENT_INFO ||
+            eventId == DXGKRNL_EVENT_FLIP_INFO ||
+            eventId == DXGKRNL_EVENT_BLIT_INFO) {
+            isValidPresentEvent = true;
+            isDxgKrnlOnlyEvent = true;
+        }
+    }
+
+    if (!isValidPresentEvent) return;
 
     double ts = (double)pEvent->EventHeader.TimeStamp.QuadPart / g_qpcFreq;
 
@@ -1044,14 +1118,50 @@ static void WINAPI EtwCallback(PEVENT_RECORD pEvent)
     static DWORD s_lastPid   = 0;
     static int   s_count     = 0;
     static double s_startTs  = 0;
+    static int   s_dxgiCount = 0;      // Count of DXGI events (DirectX 10/11/12)
+    static int   s_d3d9Count = 0;      // Count of D3D9 events
+    static int   s_dxgKrnlCount = 0;   // Count of DxgKrnl-only events (Vulkan/OpenGL)
 
-    if (pid != s_lastPid) { s_lastPid = pid; s_count = 0; s_startTs = ts; return; }
+    if (pid != s_lastPid) { 
+        s_lastPid = pid; 
+        s_count = 0; 
+        s_dxgiCount = 0;
+        s_d3d9Count = 0;
+        s_dxgKrnlCount = 0;
+        s_startTs = ts; 
+        g_detectedAPI.store(GraphicsAPI::Unknown, std::memory_order_relaxed);
+        return; 
+    }
 
     s_count++;
+    if (isDxgiEvent) s_dxgiCount++;
+    if (isD3D9Event) s_d3d9Count++;
+    if (isDxgKrnlOnlyEvent) s_dxgKrnlCount++;
+    
     double elapsed = ts - s_startTs;
     if (elapsed >= 1.0) {
         g_gameFps.store((float)s_count / (float)elapsed, std::memory_order_relaxed);
-        s_count  = 0;
+        
+        // Determine graphics API based on event source priority:
+        // 1. D3D9 provider = DirectX 9
+        // 2. DXGI provider = DirectX 10/11/12
+        // 3. Only DxgKrnl events = Vulkan or OpenGL (most modern games = Vulkan)
+        if (s_d3d9Count > 0) {
+            g_detectedAPI.store(GraphicsAPI::DirectX9, std::memory_order_relaxed);
+        } else if (s_dxgiCount > 0) {
+            // DXGI events = DirectX 10/11/12
+            // Report as "DirectX" - version detection would require deeper analysis
+            g_detectedAPI.store(GraphicsAPI::DirectX11, std::memory_order_relaxed);
+        } else if (s_dxgKrnlCount > 0) {
+            // Only DxgKrnl events, no DXGI or D3D9 = Vulkan or OpenGL
+            // Most modern games using this path are Vulkan
+            g_detectedAPI.store(GraphicsAPI::Vulkan, std::memory_order_relaxed);
+        }
+        
+        s_count = 0;
+        s_dxgiCount = 0;
+        s_d3d9Count = 0;
+        s_dxgKrnlCount = 0;
         s_startTs = ts;
     }
 }
@@ -1082,6 +1192,7 @@ static bool StartEtwSession()
     ULONG rc = StartTraceA(&g_etwSession, ETW_SESSION_NAME, &buf.p);
     if (rc != ERROR_SUCCESS) return false;
 
+    // Enable DXGI provider for DirectX 10/11/12 Present events
     rc = EnableTraceEx2(g_etwSession, &DXGI_PROVIDER,
                         EVENT_CONTROL_CODE_ENABLE_PROVIDER,
                         TRACE_LEVEL_INFORMATION, 0, 0, 0, nullptr);
@@ -1092,6 +1203,24 @@ static bool StartEtwSession()
         ControlTraceA(g_etwSession, nullptr, &buf.p, EVENT_TRACE_CONTROL_STOP);
         g_etwSession = 0;
         return false;
+    }
+
+    // Enable D3D9 provider for DirectX 9 games
+    rc = EnableTraceEx2(g_etwSession, &D3D9_PROVIDER,
+                        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                        TRACE_LEVEL_INFORMATION, 0, 0, 0, nullptr);
+    // D3D9 provider is optional - continue if it fails
+
+    // Enable DxgKrnl provider for Vulkan, OpenGL, and all other graphics APIs
+    // The Present keyword (0x8000000) captures Present, Flip, and Blit events at the kernel level
+    rc = EnableTraceEx2(g_etwSession, &DXGKRNL_PROVIDER,
+                        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                        TRACE_LEVEL_INFORMATION, 
+                        DXGKRNL_KEYWORD_PRESENT | DXGKRNL_KEYWORD_BASE, 
+                        0, 0, nullptr);
+    if (rc != ERROR_SUCCESS) {
+        // DxgKrnl failed - continue anyway with just DXGI (DirectX will still work)
+        // This might fail on older Windows versions or without proper permissions
     }
 
     EVENT_TRACE_LOGFILEA logFile = {};
@@ -1693,6 +1822,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             // ── Reset FPS when target app changes or closes ──
             if (currentPid != g_lastTargetPid) {
                 g_gameFps.store(0.0f, std::memory_order_relaxed);
+                g_detectedAPI.store(GraphicsAPI::Unknown, std::memory_order_relaxed);
                 g_lastTargetPid = currentPid;
                 // Update process name
                 GetProcessName(currentPid, g_targetProcessName, sizeof(g_targetProcessName));
@@ -1925,10 +2055,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     ImGui::TextColored(ColorByLoad(pct), "RAM %.0f%% %.1f/%.0fG", pct, ramUsed, ramTotal);
                 }
                 
-                // Process name on second line (compact)
+                // Process name and Graphics API on second line (compact)
                 if (g_Config.showFPS && g_targetProcessName[0]) {
                     ImGui::SetWindowFontScale(0.78f);
-                    ImGui::TextColored(ImVec4(.42f,.52f,.42f,1), "%s", g_targetProcessName);
+                    // Show Graphics API if detected
+                    const char* apiStr = GetGraphicsAPIString(g_detectedAPI.load(std::memory_order_relaxed));
+                    if (apiStr) {
+                        ImGui::TextColored(ImVec4(.42f,.52f,.42f,1), "%s | %s", g_targetProcessName, apiStr);
+                    } else {
+                        ImGui::TextColored(ImVec4(.42f,.52f,.42f,1), "%s", g_targetProcessName);
+                    }
                     ImGui::SetWindowFontScale(1.0f);
                 }
             }
@@ -1952,6 +2088,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     if (g_targetProcessName[0]) {
                         ImGui::SetWindowFontScale(0.82f);
                         ImGui::TextColored(ImVec4(.42f,.55f,.42f,1), "  %s", g_targetProcessName);
+                        // Show Graphics API on separate line
+                        const char* apiStr = GetGraphicsAPIString(g_detectedAPI.load(std::memory_order_relaxed));
+                        if (apiStr) {
+                            ImGui::TextColored(ImVec4(.55f,.55f,.75f,1), "  Graphics API: %s", apiStr);
+                        }
                         ImGui::SetWindowFontScale(1.0f);
                     } else {
                         ImGui::SetWindowFontScale(0.82f);
