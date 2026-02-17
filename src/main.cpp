@@ -300,6 +300,8 @@ static bool          g_OvlVisible = true;
 static HINSTANCE      g_hInstance = nullptr;
 static HWND           g_hwnd     = nullptr;
 static NOTIFYICONDATA g_nid      = {};
+static RECT           g_overlayBounds = {0, 0, 0, 0};  // ImGui overlay bounds for hit-testing
+static bool           g_isDragging = false;            // True when user is dragging the overlay
 
 // ── Hardware info ──
 static char g_cpuName[256] = "Unknown";
@@ -335,11 +337,7 @@ static std::string g_lhwmGpuTempPath;      // e.g., "/gpu-nvidia/0/temperature/0
 static std::string g_lhwmGpuLoadPath;      // e.g., "/gpu-nvidia/0/load/0"
 static std::string g_lhwmGpuVramUsedPath;  // VRAM used
 static std::string g_lhwmGpuVramTotalPath; // VRAM total
-static float g_lhwmCpuTemp = 0.0f;
-static float g_lhwmGpuTemp = 0.0f;
-static float g_lhwmGpuLoad = 0.0f;
-static float g_lhwmGpuVramUsed = 0.0f;     // in GB
-static float g_lhwmGpuVramTotal = 0.0f;    // in GB
+static float g_lhwmCpuTemp = 0.0f;         // CPU temp from LHWM (used directly)
 
 // ── DX11 ──
 static ID3D11Device*           g_pd3dDevice        = nullptr;
@@ -823,14 +821,6 @@ static bool InitLHWM()
         auto sensors = LHWM::GetHardwareSensorMap();
         if (sensors.empty()) return false;
         
-        // Debug: write sensor list to file for troubleshooting
-        FILE* dbg = nullptr;
-        fopen_s(&dbg, "lhwm_sensors.txt", "w");
-        if (dbg) {
-            fprintf(dbg, "LHWM Sensors Found:\n");
-            fprintf(dbg, "==================\n\n");
-        }
-        
         // The map structure from lhwm-cpp-wrapper is:
         // Key (map key) = Hardware name (e.g., "AMD Ryzen 9 5900HS...")
         // Value = vector<tuple<sensorName, sensorType, sensorPath>>
@@ -842,11 +832,6 @@ static bool InitLHWM()
         g_gpuCount = 0;  // Reset GPU count
         
         for (const auto& [hardwareName, sensorList] : sensors) {
-            // Debug: log hardware name
-            if (dbg) {
-                fprintf(dbg, "Hardware: %s\n", hardwareName.c_str());
-            }
-            
             // Check if this is CPU or GPU hardware by hardware name
             bool isCpuHardware = (hardwareName.find("Ryzen") != std::string::npos ||
                                   hardwareName.find("Intel") != std::string::npos ||
@@ -881,13 +866,6 @@ static bool InitLHWM()
             // Iterate through all sensors for this hardware
             for (const auto& sensorInfo : sensorList) {
                 const auto& [sensorName, sensorType, sensorPath] = sensorInfo;
-                
-                // Debug output
-                if (dbg) {
-                    fprintf(dbg, "  Sensor: %s\n", sensorName.c_str());
-                    fprintf(dbg, "    Type: %s\n", sensorType.c_str());
-                    fprintf(dbg, "    Path: %s\n", sensorPath.c_str());
-                }
                 
                 // Also detect by path pattern
                 bool isCpuPath = (sensorPath.find("/amdcpu/") != std::string::npos ||
@@ -946,8 +924,6 @@ static bool InitLHWM()
                     }
                 }
             }
-            
-            if (dbg) fprintf(dbg, "\n");
         }
         
         // Use fallback CPU temp if needed
@@ -970,21 +946,6 @@ static bool InitLHWM()
             snprintf(g_gpuName, sizeof(g_gpuName), "%s", g_gpuList[idx].name);
         }
         
-        if (dbg) {
-            fprintf(dbg, "==================\n");
-            fprintf(dbg, "GPUs Found: %d\n", g_gpuCount);
-            for (int i = 0; i < g_gpuCount; i++) {
-                fprintf(dbg, "  [%d] %s\n", i, g_gpuList[i].name);
-                fprintf(dbg, "      Temp: %s\n", g_gpuList[i].tempPath.empty() ? "(none)" : g_gpuList[i].tempPath.c_str());
-                fprintf(dbg, "      Load: %s\n", g_gpuList[i].loadPath.empty() ? "(none)" : g_gpuList[i].loadPath.c_str());
-            }
-            fprintf(dbg, "\nSelected Sensors:\n");
-            fprintf(dbg, "  CPU Temp: %s\n", g_lhwmCpuTempPath.empty() ? "(none)" : g_lhwmCpuTempPath.c_str());
-            fprintf(dbg, "  GPU Temp: %s\n", g_lhwmGpuTempPath.empty() ? "(none)" : g_lhwmGpuTempPath.c_str());
-            fprintf(dbg, "  GPU Load: %s\n", g_lhwmGpuLoadPath.empty() ? "(none)" : g_lhwmGpuLoadPath.c_str());
-            fclose(dbg);
-        }
-        
         return !g_lhwmCpuTempPath.empty() || g_gpuCount > 0;
     }
     catch (...) {
@@ -997,28 +958,24 @@ static void PollLHWMStats()
     if (!g_lhwmAvailable) return;
     
     try {
-        // CPU temperature
+        // CPU temperature (stored in g_lhwmCpuTemp, used directly elsewhere)
         if (!g_lhwmCpuTempPath.empty()) {
             g_lhwmCpuTemp = LHWM::GetSensorValue(g_lhwmCpuTempPath);
         }
         
-        // GPU stats - update both LHWM-specific and unified variables
+        // GPU stats - write directly to unified variables
         if (!g_lhwmGpuTempPath.empty()) {
-            g_lhwmGpuTemp = LHWM::GetSensorValue(g_lhwmGpuTempPath);
-            g_gpuTemp = g_lhwmGpuTemp;
+            g_gpuTemp = LHWM::GetSensorValue(g_lhwmGpuTempPath);
         }
         if (!g_lhwmGpuLoadPath.empty()) {
-            g_lhwmGpuLoad = LHWM::GetSensorValue(g_lhwmGpuLoadPath);
-            g_gpuUsage = g_lhwmGpuLoad;
+            g_gpuUsage = LHWM::GetSensorValue(g_lhwmGpuLoadPath);
         }
         if (!g_lhwmGpuVramUsedPath.empty()) {
             // Value is in MB, convert to GB
-            g_lhwmGpuVramUsed = LHWM::GetSensorValue(g_lhwmGpuVramUsedPath) / 1024.0f;
-            g_vramUsed = g_lhwmGpuVramUsed;
+            g_vramUsed = LHWM::GetSensorValue(g_lhwmGpuVramUsedPath) / 1024.0f;
         }
         if (!g_lhwmGpuVramTotalPath.empty()) {
-            g_lhwmGpuVramTotal = LHWM::GetSensorValue(g_lhwmGpuVramTotalPath) / 1024.0f;
-            g_vramTotal = g_lhwmGpuVramTotal;
+            g_vramTotal = LHWM::GetSensorValue(g_lhwmGpuVramTotalPath) / 1024.0f;
         }
     }
     catch (...) {
@@ -1463,7 +1420,8 @@ static void Present(float r, float g, float b, float a)
     g_pd3dDeviceContext->OMSetRenderTargets(1, &g_pRenderTargetView, nullptr);
     g_pd3dDeviceContext->ClearRenderTargetView(g_pRenderTargetView, c);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-    g_pSwapChain->Present(1, 0);
+    // Disable VSync while dragging for instant response (reduces ~16ms latency per frame)
+    g_pSwapChain->Present(g_isDragging ? 0 : 1, 0);
 }
 
 static ImVec4 ColorByLoad(float v, float warn = 70, float crit = 90)
@@ -1629,7 +1587,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::SetWindowFontScale(1.4f);
             ImGui::TextColored(ImVec4(.35f,.78f,1,1), "FPS Overlay");
             ImGui::SetWindowFontScale(1.0f);
-            ImGui::SameLine(); ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " Beta v1.3.0");
+            ImGui::SameLine(); ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " Beta v1.4.0");
 
             // Developer text
             ImGui::Spacing();
@@ -1834,50 +1792,103 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             }
 
             // ── Periodic metrics (once/sec) ──
+            // Skip ALL stats reading while dragging for maximum smoothness
+            static float cachedRamUsed = 0, cachedRamTotal = 1;
             auto now = Clock::now();
 
-            float cpuElapsed = std::chrono::duration<float>(now - lastCpuTime).count();
-            if (cpuElapsed >= 1.0f) {
-                cpuUsage = GetCpuUsage();
-                // Poll CPU temp - prefer LHWM over WMI
-                if (g_lhwmAvailable && !g_lhwmCpuTempPath.empty()) {
-                    g_cpuTemp = g_lhwmCpuTemp;
-                } else if (g_cpuTempAvailable) {
-                    g_cpuTemp = QueryCpuTemperature();
+            if (!g_isDragging) {
+                float cpuElapsed = std::chrono::duration<float>(now - lastCpuTime).count();
+                if (cpuElapsed >= 1.0f) {
+                    cpuUsage = GetCpuUsage();
+                    // Poll CPU temp - prefer LHWM over WMI
+                    if (g_lhwmAvailable && !g_lhwmCpuTempPath.empty()) {
+                        g_cpuTemp = g_lhwmCpuTemp;
+                    } else if (g_cpuTempAvailable) {
+                        g_cpuTemp = QueryCpuTemperature();
+                    }
+                    lastCpuTime = now;
                 }
-                lastCpuTime = now;
-            }
 
-            float gpuElapsed = std::chrono::duration<float>(now - lastGpuTime).count();
-            if (gpuElapsed >= 1.0f) {
-                // Poll LHWM first (covers AMD, Intel, NVIDIA)
-                if (g_lhwmAvailable) {
-                    PollLHWMStats();
+                float gpuElapsed = std::chrono::duration<float>(now - lastGpuTime).count();
+                if (gpuElapsed >= 1.0f) {
+                    // Poll LHWM first (covers AMD, Intel, NVIDIA)
+                    if (g_lhwmAvailable) {
+                        PollLHWMStats();
+                    }
+                    lastGpuTime = now;
                 }
-                lastGpuTime = now;
-            }
 
-            // ── RAM ──
-            MEMORYSTATUSEX mem = {}; mem.dwLength = sizeof(mem);
-            GlobalMemoryStatusEx(&mem);
-            float ramUsed  = (float)(mem.ullTotalPhys - mem.ullAvailPhys) / (1024.f*1024.f*1024.f);
-            float ramTotal = (float)(mem.ullTotalPhys)                    / (1024.f*1024.f*1024.f);
+                // ── RAM ──
+                MEMORYSTATUSEX mem = {}; mem.dwLength = sizeof(mem);
+                GlobalMemoryStatusEx(&mem);
+                cachedRamUsed  = (float)(mem.ullTotalPhys - mem.ullAvailPhys) / (1024.f*1024.f*1024.f);
+                cachedRamTotal = (float)(mem.ullTotalPhys)                    / (1024.f*1024.f*1024.f);
+            }
+            
+            // Use cached values (updated when not dragging)
+            float ramUsed = cachedRamUsed;
+            float ramTotal = cachedRamTotal;
 
             // ── Game FPS (from ETW) ──
             float gameFps = g_gameFps.load(std::memory_order_relaxed);
 
             // ── Handle CTRL key for dragging / right-click menu ──
-            // When CTRL is held, disable click-through so user can drag or right-click
-            static bool wasCtrlHeld = false;
-            bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-            if (ctrlHeld != wasCtrlHeld) {
-                SetClickThrough(!ctrlHeld);
-                wasCtrlHeld = ctrlHeld;
+            // Only respond to CTRL when cursor is hovering over the overlay
+            POINT cursorPt; GetCursorPos(&cursorPt);
+            bool cursorOverOverlay = PtInRect(&g_overlayBounds, cursorPt);
+            bool ctrlKeyDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool leftMouseDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+            
+            // Track interaction and drag state separately
+            // - interactionActive: controls click-through and window flags
+            // - g_isDragging: controls VSync (set by ImGui's drag detection for accuracy)
+            static bool interactionActive = false;
+            
+            // Reset drag state when mouse released
+            if (!leftMouseDown) {
+                g_isDragging = false;
             }
             
-            // Right-click context menu (when CTRL is held)
-            if (ctrlHeld && (GetAsyncKeyState(VK_RBUTTON) & 1)) {
-                POINT pt; GetCursorPos(&pt);
+            // Enter interaction mode: Ctrl held AND cursor over overlay
+            if (ctrlKeyDown && cursorOverOverlay) {
+                interactionActive = true;
+            }
+            // Exit interaction mode: Ctrl released, OR (cursor left overlay AND not actively interacting)
+            else if (!ctrlKeyDown) {
+                interactionActive = false;
+                g_isDragging = false;
+            }
+            else if (!cursorOverOverlay && !leftMouseDown) {
+                // Only exit if cursor left AND not holding mouse button
+                interactionActive = false;
+            }
+            // While mouse is held, stay in interaction mode regardless of cursor position
+            
+            bool ctrlHeld = interactionActive;
+            
+            // Manage click-through state
+            // IMPORTANT: Don't re-enable click-through while mouse button is held
+            // (this would interrupt an ongoing drag operation)
+            static bool wasCtrlHeld = false;
+            if (ctrlHeld && !wasCtrlHeld) {
+                // Entering interaction mode - disable click-through
+                SetClickThrough(false);
+                wasCtrlHeld = true;
+            } else if (!ctrlHeld && wasCtrlHeld && !leftMouseDown) {
+                // Exiting interaction mode - re-enable click-through only if mouse is released
+                SetClickThrough(true);
+                wasCtrlHeld = false;
+            }
+            
+            // Right-click context menu (when CTRL is held AND right-click happens IN interaction mode)
+            // Track right mouse button state to detect fresh clicks (not clicks from elsewhere)
+            static bool rightMouseWasDown = false;
+            bool rightMouseDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+            bool rightMouseJustPressed = rightMouseDown && !rightMouseWasDown;
+            rightMouseWasDown = rightMouseDown;
+            
+            // Only show menu if right-click happened while already in interaction mode
+            if (ctrlHeld && rightMouseJustPressed) {
                 HMENU m = CreatePopupMenu();
                 AppendMenu(m, MF_STRING, IDM_HIDE, "Hide Overlay");
                 AppendMenu(m, MF_SEPARATOR, 0, nullptr);
@@ -1885,7 +1896,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 AppendMenu(m, MF_STRING, IDM_EXIT, "Exit");
                 SetForegroundWindow(g_hwnd);
                 int cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                                         pt.x, pt.y, 0, g_hwnd, nullptr);
+                                         cursorPt.x, cursorPt.y, 0, g_hwnd, nullptr);
                 DestroyMenu(m);
                 switch (cmd) {
                     case IDM_HIDE:     g_OvlVisible = false;           break;
@@ -1900,6 +1911,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::NewFrame();
 
             // Position: use custom if set, otherwise use corner preset
+            // IMPORTANT: Don't set position during interaction mode - let ImGui handle dragging
             float margin = 16;
             int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
             ImVec2 pos, pivot = {0, 0};
@@ -1919,8 +1931,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 }
             }
             
-            // Only force position on first frame or if using corner preset and haven't dragged
-            ImGui::SetNextWindowPos(pos, hasCustomPos ? ImGuiCond_Once : ImGuiCond_Always, pivot);
+            // Only set position when NOT in interaction mode to avoid fighting with ImGui's drag
+            // - When not interacting: set position (either corner preset or saved custom position)
+            // - When interacting (ctrlHeld): let ImGui manage position freely for smooth dragging
+            if (!ctrlHeld) {
+                ImGui::SetNextWindowPos(pos, hasCustomPos ? ImGuiCond_Once : ImGuiCond_Always, pivot);
+            }
             
             // Full opacity when CTRL held, otherwise user setting
             ImGui::SetNextWindowBgAlpha(ctrlHeld ? 1.0f : (g_Config.opacity / 100.f));
@@ -1938,11 +1954,27 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
             ImGui::Begin("##ovl", nullptr, wf);
             
-            // Save position when dragged
+            // Update overlay bounds for hit-testing (used for context menu check)
+            {
+                ImVec2 wPos = ImGui::GetWindowPos();
+                ImVec2 wSize = ImGui::GetWindowSize();
+                g_overlayBounds.left   = (LONG)wPos.x;
+                g_overlayBounds.top    = (LONG)wPos.y;
+                g_overlayBounds.right  = (LONG)(wPos.x + wSize.x);
+                g_overlayBounds.bottom = (LONG)(wPos.y + wSize.y);
+            }
+            
+            // Save position when dragged and update drag state
             if (ctrlHeld) {
                 ImVec2 winPos = ImGui::GetWindowPos();
                 g_Config.customX = winPos.x;
                 g_Config.customY = winPos.y;
+                
+                // Disable VSync as soon as user clicks in interaction mode
+                // (don't wait for drag threshold - this prevents initial lag)
+                if (leftMouseDown) {
+                    g_isDragging = true;
+                }
             }
             
             // ── Draw glowing border when CTRL is held ──
@@ -2225,22 +2257,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         return 0;
     case WM_CONTEXTMENU:
-        // Right-click on overlay window itself
+        // Right-click on overlay window itself - only show if Ctrl is held AND cursor is over overlay
+        // This prevents showing our menu when user right-clicked elsewhere
         if (g_Mode == MODE_OVERLAY) {
+            bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
             POINT pt; GetCursorPos(&pt);
-            HMENU m = CreatePopupMenu();
-            AppendMenu(m, MF_STRING, IDM_HIDE, "Hide Overlay");
-            AppendMenu(m, MF_SEPARATOR, 0, nullptr);
-            AppendMenu(m, MF_STRING, IDM_SETTINGS, "Settings");
-            AppendMenu(m, MF_STRING, IDM_EXIT, "Exit");
-            SetForegroundWindow(hWnd);
-            int cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                                     pt.x, pt.y, 0, hWnd, nullptr);
-            DestroyMenu(m);
-            switch (cmd) {
-                case IDM_HIDE:     g_OvlVisible = false;           break;
-                case IDM_SETTINGS: g_Pending = CMD_SHOW_SETTINGS;  break;
-                case IDM_EXIT:     g_Pending = CMD_EXIT;           break;
+            // Only show menu if Ctrl is held AND cursor is over the overlay
+            if (ctrlHeld && PtInRect(&g_overlayBounds, pt)) {
+                HMENU m = CreatePopupMenu();
+                AppendMenu(m, MF_STRING, IDM_HIDE, "Hide Overlay");
+                AppendMenu(m, MF_SEPARATOR, 0, nullptr);
+                AppendMenu(m, MF_STRING, IDM_SETTINGS, "Settings");
+                AppendMenu(m, MF_STRING, IDM_EXIT, "Exit");
+                SetForegroundWindow(hWnd);
+                int cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                                         pt.x, pt.y, 0, hWnd, nullptr);
+                DestroyMenu(m);
+                switch (cmd) {
+                    case IDM_HIDE:     g_OvlVisible = false;           break;
+                    case IDM_SETTINGS: g_Pending = CMD_SHOW_SETTINGS;  break;
+                    case IDM_EXIT:     g_Pending = CMD_EXIT;           break;
+                }
             }
         }
         return 0;
