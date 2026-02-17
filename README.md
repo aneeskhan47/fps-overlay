@@ -8,7 +8,7 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 
 ## Features
 
-- **FPS** — Real game framerate via Windows ETW (same method the pros use)
+- **FPS** — Real game framerate via Windows ETW (supports DirectX 9-12, OpenGL, Vulkan)
 - **GPU** — Usage & temperature (supports NVIDIA, AMD, and Intel via LibreHardwareMonitor)
 - **Multi-GPU Support** — Detect and select which GPU to monitor from settings
 - **VRAM** — GPU memory usage percentage and used/total GB
@@ -21,7 +21,7 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 - **Fully click-through** — Never interferes with your game
 - **Custom hotkeys** — Bind toggle/exit to whatever you want
 - **System tray integration** — Stays out of your way
-- **Hold CTRL to drag** — Position it exactly where you want with visual feedback
+- **Hold CTRL to drag** — Hover over the overlay and hold CTRL to move it (won't interfere with other apps)
 - **Lightweight** — No installer, no background services, no bloat
 
 ## Screenshot
@@ -73,10 +73,12 @@ Or build it yourself (see below).
 
 | Action | How |
 |--------|-----|
-| Move overlay | Hold **CTRL** + drag |
-| Right-click menu | Hold **CTRL** + right-click |
+| Move overlay | Hover over overlay + hold **CTRL** + drag |
+| Right-click menu | Hover over overlay + hold **CTRL** + right-click |
 | Toggle visibility | Your configured hotkey (default: **Insert**) |
 | Exit | Your configured hotkey (default: **End**) |
+
+> **Note:** The overlay only responds to CTRL when your mouse is hovering over it, so it won't interfere with CTRL shortcuts in other applications.
 
 ## Why ETW? Why Admin?
 
@@ -91,20 +93,21 @@ There are basically 3 ways to get real game FPS:
 I went with **ETW** because:
 
 - **Anti-cheat safe** — Doesn't touch game processes at all
-- **Universal** — Works with any DX10/11/12 game
+- **Universal** — Works with DirectX 9/10/11/12, OpenGL, and Vulkan games
 - **No injection** — Nothing gets loaded into the game
 
 The tradeoff is that ETW requires admin because it's a system-wide kernel tracing API. Windows won't let unprivileged apps listen to cross-process events for security reasons. Same reason PresentMon and CapFrameX need admin — it's a Windows security requirement, not a design choice.
 
-### DirectX Compatibility
+### Graphics API Compatibility
 
-| DirectX Version | Supported |
-|-----------------|-----------|
+| Graphics API | Supported |
+|--------------|-----------|
 | DirectX 12 | ✅ Yes |
 | DirectX 11 | ✅ Yes |
 | DirectX 10/10.1 | ✅ Yes |
-| DirectX 9 | ❌ No (predates DXGI) |
-| OpenGL / Vulkan | ❌ No |
+| DirectX 9 | ✅ Yes (via D3D9 ETW provider) |
+| OpenGL | ✅ Yes (via DxgKrnl ETW provider) |
+| Vulkan | ✅ Yes (via DxgKrnl ETW provider) |
 
 ## Building from Source
 
@@ -157,7 +160,7 @@ fps-overlay/
 - **Build:** MSVC (Visual Studio Build Tools)
 - **Graphics:** DirectX 11
 - **UI:** Dear ImGui
-- **FPS Tracking:** Windows ETW (Event Tracing for Windows)
+- **FPS Tracking:** Windows ETW (Event Tracing for Windows) with D3D9, DXGI, and DxgKrnl providers
 - **GPU Stats:** LibreHardwareMonitor (supports NVIDIA, AMD, Intel)
 - **CPU Temp:** LibreHardwareMonitor / WMI fallback
 - **Windowing:** Win32 API (layered transparent window)
