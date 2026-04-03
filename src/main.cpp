@@ -100,6 +100,7 @@ struct OverlayConfig {
     bool showRAM  = true;
     bool horizontal = false;  // horizontal compact view
     bool useFahrenheit = false; // false = Celsius, true = Fahrenheit
+    bool autoStart = false;   // skip config window and start overlay immediately
     int  position = 0;        // 0=TL  1=TR  2=BL  3=BR
     int  opacity  = 85;       // 30..100 %
     int  toggleKey = VK_INSERT;
@@ -201,6 +202,7 @@ static void LoadConfig(OverlayConfig& cfg)
     // Layout settings
     cfg.horizontal    = ReadIniInt("Layout", "horizontal", 0) != 0;
     cfg.useFahrenheit = ReadIniInt("Layout", "useFahrenheit", 0) != 0;
+    cfg.autoStart     = ReadIniInt("Layout", "autoStart", 0) != 0;
     cfg.position      = ReadIniInt("Layout", "position", 0);
     cfg.opacity       = ReadIniInt("Layout", "opacity", 85);
     cfg.customX       = ReadIniFloat("Layout", "customX", -1.0f);
@@ -272,6 +274,7 @@ static void SaveConfig(const OverlayConfig& cfg)
     // Layout settings
     WriteIniInt("Layout", "horizontal", cfg.horizontal ? 1 : 0);
     WriteIniInt("Layout", "useFahrenheit", cfg.useFahrenheit ? 1 : 0);
+    WriteIniInt("Layout", "autoStart", cfg.autoStart ? 1 : 0);
     WriteIniInt("Layout", "position", cfg.position);
     WriteIniInt("Layout", "opacity", cfg.opacity);
     WriteIniFloat("Layout", "customX", cfg.customX);
@@ -1506,8 +1509,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         g_cpuTempAvailable = true;
     }
 
-    ShowWindow(g_hwnd, SW_SHOW);
-    UpdateWindow(g_hwnd);
+    // Show config window (unless auto-start is enabled)
+    if (!g_Config.autoStart) {
+        ShowWindow(g_hwnd, SW_SHOW);
+        UpdateWindow(g_hwnd);
+    }
 
     // ── ImGui context (lives for the whole app) ──
     IMGUI_CHECKVERSION();
@@ -1528,6 +1534,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     auto lastGpuTime = lastCpuTime;
     float cpuUsage = 0;
     GetCpuUsage(); // seed
+
+    // ── Auto-start overlay if enabled ──
+    if (g_Config.autoStart) {
+        g_Pending = CMD_START_OVERLAY;
+    }
 
     // ── Main loop ──
     MSG msg = {};
@@ -1716,6 +1727,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Change##2")) g_listeningFor = 2;
             }
+
+            // ── STARTUP ──
+            ImGui::Spacing(); ImGui::Spacing();
+            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "STARTUP");
+            ImGui::Spacing();
+            ImGui::Checkbox("  Start overlay immediately", &g_Config.autoStart);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Skip this window and start the overlay directly next time");
 
             // ── HARDWARE ──
             ImGui::Spacing(); ImGui::Spacing();
