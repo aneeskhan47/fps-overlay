@@ -21,6 +21,7 @@
 #include <psapi.h>
 #include <wbemidl.h>
 #include <comdef.h>
+#include <winhttp.h>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -30,6 +31,8 @@
 #include <mutex>
 #include <vector>
 #include <algorithm>
+
+#pragma comment(lib, "winhttp.lib")
 
 // Note: Link with -lwbemuuid -lole32 -loleaut32 for WMI support
 // Note: Link with lhwm-cpp-wrapper.lib and mscoree.lib for LibreHardwareMonitor support
@@ -48,6 +51,10 @@
 #define IDM_EXIT      1002
 #define IDM_SHOW      1003
 #define IDM_HIDE      1004
+#define IDM_UPDATE    1005
+
+// Current version
+#define APP_VERSION "v1.4.1-beta"
 
 // PawnIO installer resource ID (embedded executable)
 #define IDR_PAWNIO_SETUP 101
@@ -100,6 +107,7 @@ struct OverlayConfig {
     bool showRAM  = true;
     bool horizontal = false;  // horizontal compact view
     bool useFahrenheit = false; // false = Celsius, true = Fahrenheit
+    bool autoStart = false;   // skip config window and start overlay immediately
     int  position = 0;        // 0=TL  1=TR  2=BL  3=BR
     int  opacity  = 85;       // 30..100 %
     int  toggleKey = VK_INSERT;
@@ -201,6 +209,7 @@ static void LoadConfig(OverlayConfig& cfg)
     // Layout settings
     cfg.horizontal    = ReadIniInt("Layout", "horizontal", 0) != 0;
     cfg.useFahrenheit = ReadIniInt("Layout", "useFahrenheit", 0) != 0;
+    cfg.autoStart     = ReadIniInt("Layout", "autoStart", 0) != 0;
     cfg.position      = ReadIniInt("Layout", "position", 0);
     cfg.opacity       = ReadIniInt("Layout", "opacity", 85);
     cfg.customX       = ReadIniFloat("Layout", "customX", -1.0f);
@@ -272,6 +281,7 @@ static void SaveConfig(const OverlayConfig& cfg)
     // Layout settings
     WriteIniInt("Layout", "horizontal", cfg.horizontal ? 1 : 0);
     WriteIniInt("Layout", "useFahrenheit", cfg.useFahrenheit ? 1 : 0);
+    WriteIniInt("Layout", "autoStart", cfg.autoStart ? 1 : 0);
     WriteIniInt("Layout", "position", cfg.position);
     WriteIniInt("Layout", "opacity", cfg.opacity);
     WriteIniFloat("Layout", "customX", cfg.customX);
@@ -306,6 +316,89 @@ static bool           g_isDragging = false;            // True when user is drag
 // ── Hardware info ──
 static char g_cpuName[256] = "Unknown";
 static char g_gpuName[256] = "Unknown";
+
+// ── Update checker state ──
+static std::atomic<bool> g_updateAvailable{false};
+static std::atomic<bool> g_updateCheckDone{false};
+static char g_latestVersion[32] = "";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Update checker (checks GitHub releases API)
+// ═══════════════════════════════════════════════════════════════════════════
+static void CheckForUpdatesAsync()
+{
+    std::thread([]() {
+        HINTERNET hSession = WinHttpOpen(L"FPS-Overlay/1.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) { g_updateCheckDone = true; return; }
+
+        HINTERNET hConnect = WinHttpConnect(hSession, L"api.github.com",
+            INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (!hConnect) {
+            WinHttpCloseHandle(hSession);
+            g_updateCheckDone = true;
+            return;
+        }
+
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET",
+            L"/repos/aneeskhan47/fps-overlay/releases/latest",
+            nullptr, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            WINHTTP_FLAG_SECURE);
+        if (!hRequest) {
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            g_updateCheckDone = true;
+            return;
+        }
+
+        if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+            !WinHttpReceiveResponse(hRequest, nullptr)) {
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            g_updateCheckDone = true;
+            return;
+        }
+
+        // Read response
+        std::string response;
+        DWORD bytesRead = 0;
+        char buffer[4096];
+        while (WinHttpReadData(hRequest, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead > 0) {
+            buffer[bytesRead] = '\0';
+            response += buffer;
+        }
+
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+
+        // Parse "tag_name" from JSON response (simple string search)
+        const char* tagKey = "\"tag_name\"";
+        size_t pos = response.find(tagKey);
+        if (pos != std::string::npos) {
+            pos = response.find(':', pos);
+            if (pos != std::string::npos) {
+                size_t start = response.find('"', pos + 1);
+                size_t end = response.find('"', start + 1);
+                if (start != std::string::npos && end != std::string::npos && end > start) {
+                    std::string latestTag = response.substr(start + 1, end - start - 1);
+                    snprintf(g_latestVersion, sizeof(g_latestVersion), "%s", latestTag.c_str());
+                    
+                    // Compare versions (simple string comparison)
+                    if (strcmp(g_latestVersion, APP_VERSION) != 0) {
+                        g_updateAvailable = true;
+                    }
+                }
+            }
+        }
+        g_updateCheckDone = true;
+    }).detach();
+}
 
 // ── GPU stats (from LHWM) ──
 static float g_gpuUsage = 0.0f;
@@ -357,6 +450,7 @@ void    CreateRenderTarget();
 void    CleanupRenderTarget();
 void    AddTrayIcon();
 void    RemoveTrayIcon();
+void    UpdateTrayTooltip();
 void    SwitchToOverlay();
 void    SwitchToConfig();
 void    ShutdownBackends();
@@ -1260,6 +1354,16 @@ void AddTrayIcon()
 
 void RemoveTrayIcon() { Shell_NotifyIcon(NIM_DELETE, &g_nid); }
 
+void UpdateTrayTooltip()
+{
+    if (g_updateAvailable) {
+        snprintf(g_nid.szTip, sizeof(g_nid.szTip), "FPS Overlay - Update available! (%s)", g_latestVersion);
+    } else {
+        lstrcpy(g_nid.szTip, "FPS Overlay");
+    }
+    Shell_NotifyIcon(NIM_MODIFY, &g_nid);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // ImGui style
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1441,6 +1545,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     // ── Load saved configuration ──
     LoadConfig(g_Config);
 
+    // ── Check for updates in background ──
+    CheckForUpdatesAsync();
+
     // ── Show welcome message on first run ──
     ShowWelcomeMessage();
 
@@ -1506,8 +1613,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         g_cpuTempAvailable = true;
     }
 
-    ShowWindow(g_hwnd, SW_SHOW);
-    UpdateWindow(g_hwnd);
+    // Show config window (unless auto-start is enabled)
+    if (!g_Config.autoStart) {
+        ShowWindow(g_hwnd, SW_SHOW);
+        UpdateWindow(g_hwnd);
+    }
 
     // ── ImGui context (lives for the whole app) ──
     IMGUI_CHECKVERSION();
@@ -1528,6 +1638,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     auto lastGpuTime = lastCpuTime;
     float cpuUsage = 0;
     GetCpuUsage(); // seed
+
+    // ── Auto-start overlay if enabled ──
+    if (g_Config.autoStart) {
+        g_Pending = CMD_START_OVERLAY;
+    }
 
     // ── Main loop ──
     MSG msg = {};
@@ -1587,7 +1702,24 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::SetWindowFontScale(1.4f);
             ImGui::TextColored(ImVec4(.35f,.78f,1,1), "FPS Overlay");
             ImGui::SetWindowFontScale(1.0f);
-            ImGui::SameLine(); ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " Beta v1.4.0");
+            ImGui::SameLine(); ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " %s", APP_VERSION);
+            
+            // Show update available notification
+            if (g_updateAvailable) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(.2f,.9f,.4f,1), " -");
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(.2f,.9f,.4f,1));
+                if (ImGui::SmallButton("Update available!")) {
+                    ShellExecuteA(nullptr, "open", 
+                        "https://github.com/aneeskhan47/fps-overlay/releases/latest",
+                        nullptr, nullptr, SW_SHOWNORMAL);
+                }
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Click to download %s", g_latestVersion);
+                }
+            }
 
             // Developer text
             ImGui::Spacing();
@@ -1717,6 +1849,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 if (ImGui::SmallButton("Change##2")) g_listeningFor = 2;
             }
 
+            // ── STARTUP ──
+            ImGui::Spacing(); ImGui::Spacing();
+            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "STARTUP");
+            ImGui::Spacing();
+            ImGui::Checkbox("  Start overlay immediately", &g_Config.autoStart);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Skip this window and start the overlay directly next time");
+
             // ── HARDWARE ──
             ImGui::Spacing(); ImGui::Spacing();
             ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "DETECTED HARDWARE");
@@ -1816,6 +1956,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         PollLHWMStats();
                     }
                     lastGpuTime = now;
+                    
+                    // Update tray tooltip if update check completed
+                    static bool tooltipUpdated = false;
+                    if (g_updateCheckDone && !tooltipUpdated) {
+                        UpdateTrayTooltip();
+                        tooltipUpdated = true;
+                    }
                 }
 
                 // ── RAM ──
@@ -2234,6 +2381,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (LOWORD(lParam) == WM_RBUTTONUP) {
             POINT pt; GetCursorPos(&pt);
             HMENU m = CreatePopupMenu();
+            // Show update option if available
+            if (g_updateAvailable) {
+                char updateText[64];
+                snprintf(updateText, sizeof(updateText), "Download Update (%s)", g_latestVersion);
+                AppendMenu(m, MF_STRING, IDM_UPDATE, updateText);
+                AppendMenu(m, MF_SEPARATOR, 0, nullptr);
+            }
             // Show/Hide toggle based on current visibility
             if (g_OvlVisible)
                 AppendMenu(m, MF_STRING, IDM_HIDE, "Hide Overlay");
@@ -2249,6 +2403,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             DestroyMenu(m);
             // Handle the command directly
             switch (cmd) {
+                case IDM_UPDATE:
+                    ShellExecuteA(nullptr, "open", 
+                        "https://github.com/aneeskhan47/fps-overlay/releases/latest",
+                        nullptr, nullptr, SW_SHOWNORMAL);
+                    break;
                 case IDM_SHOW:     g_OvlVisible = true;            break;
                 case IDM_HIDE:     g_OvlVisible = false;           break;
                 case IDM_SETTINGS: g_Pending = CMD_SHOW_SETTINGS;  break;
