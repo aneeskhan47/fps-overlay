@@ -165,6 +165,12 @@ fps-overlay/
 - **CPU Temp:** LibreHardwareMonitor / WMI fallback
 - **Windowing:** Win32 API (layered transparent window)
 
+## Support the development
+**Do you like this tool? Support it by donating**
+
+- Github Sponsor: [Sponsor](https://github.com/sponsors/aneeskhan47)
+- PayPal: [Donate](https://www.paypal.com/paypalme/aneeskhan47)
+
 ## License
 
 GNU General Public License v3.0 - see [LICENSE.txt](LICENSE.txt) for details.
