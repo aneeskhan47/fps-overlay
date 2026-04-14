@@ -7,8 +7,9 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 > **⚠️ Beta Software:** This project is currently in beta and under active development. Features, UI, and behavior are subject to change. Feedback and bug reports are welcome!
 
 > [!CAUTION]
-> #### Fullscreen display modes are not supported currently\*
-> Games require **Borderless**/**Borderless Windowed** mode to be enabled via in-game display settings in order for the fps overlay to show above the game window
+> #### Fullscreen display modes are not supported\*
+> Games require **Borderless**/**Borderless Windowed** mode to be enabled via in-game display settings in order for the fps overlay to show above the game window.
+>
 > FPS Overlay will only work in windowed fullscreen mode and windowed borderless fullscreen mode, but will not work in true fullscreen mode. True fullscreen mode on desktop means that other computer applications cannot be displayed over the application that’s in true fullscreen mode.
 
 ## Features
