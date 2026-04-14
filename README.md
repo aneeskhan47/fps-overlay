@@ -6,6 +6,10 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 
 > **⚠️ Beta Software:** This project is currently in beta and under active development. Features, UI, and behavior are subject to change. Feedback and bug reports are welcome!
 
+> [!CAUTION]
+> #### Fullscreen display modes are not supported currently\*
+> Games require **Borderless**/**Borderless Windowed** mode to be enabled via in-game display settings in order for the fps overlay to show above the game window
+
 ## Features
 
 - **FPS** — Real game framerate via Windows ETW (supports DirectX 9-12, OpenGL, Vulkan)
