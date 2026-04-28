@@ -2,7 +2,7 @@
 
 A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while gaming — nothing else.
 
-![Size](https://img.shields.io/badge/size-~6MB-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![License](https://img.shields.io/badge/license-GNU%20GPLv3-green) ![Status](https://img.shields.io/badge/status-beta-orange)
+![Size](https://img.shields.io/badge/size-~4MB-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![License](https://img.shields.io/badge/license-GNU%20GPLv3-green) ![Status](https://img.shields.io/badge/status-beta-orange)
 
 > **⚠️ Beta Software:** This project is currently in beta and under active development. Features, UI, and behavior are subject to change. Feedback and bug reports are welcome!
 
@@ -14,29 +14,33 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 
 ## Features
 
-- **FPS** — Real game framerate via Windows ETW (supports DirectX 9-12, OpenGL, Vulkan)
-- **GPU** — Usage & temperature (supports NVIDIA, AMD, and Intel via LibreHardwareMonitor)
-- **Multi-GPU Support** — Detect and select which GPU to monitor from settings
-- **VRAM** — GPU memory usage percentage and used/total GB
-- **CPU** — Usage & temperature
-- **RAM** — Usage percentage and used/total GB
-- **Temperature Units** — Toggle between Celsius and Fahrenheit
-- **Process tracking** — Shows which game/app is being monitored
-- **Horizontal or vertical layout** — Your choice
-- **Persistent Settings** — All preferences saved automatically
-- **Fully click-through** — Never interferes with your game
-- **Custom hotkeys** — Bind toggle/exit to whatever you want
-- **System tray integration** — Stays out of your way
-- **Hold CTRL to drag** — Hover over the overlay and hold CTRL to move it (won't interfere with other apps)
-- **Lightweight** — No installer, no background services, no bloat
+- **FPS** — Real in-game framerate via Windows **ETW** (DirectX 9–12, OpenGL, Vulkan)
+- **CPU** — Usage, temperature, and optional **CPU clock (MHz)** with a minimal sparkline; pick the LHWM clock sensor in settings
+- **GPU** — Usage and temperature (NVIDIA, AMD, Intel via **LibreHardwareMonitor**)
+- **GPU core clock** — Optional **core frequency (MHz)** with a minimal sparkline; pick the clock sensor for the **selected GPU**
+- **Multi-GPU** — Detect all discrete GPUs and choose which one to monitor
+- **VRAM** — Memory usage (percent and used / total GB)
+- **RAM** — System memory usage (percent and used / total GB)
+- **Three layouts** — **Vertical** stack, **horizontal** compact one-liner, or a **Steam-style** bottom bar (with separate scale for the bar)
+- **Temperature units** — Celsius or Fahrenheit
+- **Process label** — Shows which process is used for the FPS / game name line
+- **Position & opacity** — Corners or drag-to-place; opacity for the overlay window
+- **Persistent settings** — Saved next to the executable (`config.ini`)
+- **Fully click-through** — Does not steal mouse focus from games
+- **Custom hotkeys** — Toggle visibility and exit (default: **Insert** and **End**)
+- **System tray** — Minimized footprint when running
+- **CTRL + drag / CTRL + right-click menu** — Move the overlay or open hide / settings / exit without affecting other apps
+- **Lightweight** — No installer, no background services, no bloat, ~4 MB portable folder
 
-## Screenshot
+## Screenshots
 
-<img width="1918" height="1198" alt="2026-02-08_16-22" src="https://github.com/user-attachments/assets/b6d3ef8b-1ccb-439b-8c66-37f80f6c2b0e" />
+| Settings | Vertical layout |
+|:---:|:---:|
+| ![Settings](screenshots/settings.png) | ![Vertical layout](screenshots/vertical_layout.png) |
 
-
-<!-- Add your screenshot here -->
-<!-- ![FPS Overlay Screenshot](screenshot.png) -->
+| Horizontal compact | Steam-like layout |
+|:---:|:---:|
+| ![Horizontal compact](screenshots/horizontal_layout.png) | ![Steam-like layout](screenshots/steamlike_layout.png) |
 
 ## Why I Built This
 
@@ -57,7 +61,7 @@ I wanted a simple FPS overlay. That's it. Just FPS, CPU, GPU, RAM stats on my sc
 
 ### So I built my own:
 
-- **~6MB total** — Single .exe, no installer, no background services
+- **~4MB total** — Single .exe plus bundled DLLs, no installer, no background services
 - **C++ with DirectX 11 + Dear ImGui** — As lightweight as it gets
 - **No account required. No telemetry. No "gaming optimization" features. No social integration. No ads. Just stats.**
 
