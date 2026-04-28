@@ -2,7 +2,7 @@
 
 A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while gaming — nothing else.
 
-![Size](https://img.shields.io/badge/size-~4MB-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![License](https://img.shields.io/badge/license-GNU%20GPLv3-green) ![Status](https://img.shields.io/badge/status-beta-orange)
+![Size](https://img.shields.io/badge/size-~9MB-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![License](https://img.shields.io/badge/license-GNU%20GPLv3-green) ![Status](https://img.shields.io/badge/status-beta-orange)
 
 > **⚠️ Beta Software:** This project is currently in beta and under active development. Features, UI, and behavior are subject to change. Feedback and bug reports are welcome!
 
@@ -28,9 +28,9 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 - **Persistent settings** — Saved next to the executable (`config.ini`)
 - **Fully click-through** — Does not steal mouse focus from games
 - **Custom hotkeys** — Toggle visibility and exit (default: **Insert** and **End**)
-- **System tray** — Minimized footprint when running
+- **System tray** — Minimized when running in the background
 - **CTRL + drag / CTRL + right-click menu** — Move the overlay or open hide / settings / exit without affecting other apps
-- **Lightweight** — No installer, no background services, no bloat, ~4 MB portable folder
+- **Lightweight** — No installer, no background services, no bloat, ~9 MB portable folder
 
 ## Screenshots
 
@@ -61,7 +61,7 @@ I wanted a simple FPS overlay. That's it. Just FPS, CPU, GPU, RAM stats on my sc
 
 ### So I built my own:
 
-- **~4MB total** — Single .exe plus bundled DLLs, no installer, no background services
+- **~9MB total** — Single .exe plus bundled DLLs, no installer, no background services
 - **C++ with DirectX 11 + Dear ImGui** — As lightweight as it gets
 - **No account required. No telemetry. No "gaming optimization" features. No social integration. No ads. Just stats.**
 
