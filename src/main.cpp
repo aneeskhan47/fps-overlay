@@ -24,6 +24,7 @@
 #include <winhttp.h>
 #include <chrono>
 #include <cstdio>
+#include <cstdarg>
 #include <cstring>
 #include <cmath>
 #include <thread>
@@ -31,6 +32,7 @@
 #include <mutex>
 #include <vector>
 #include <algorithm>
+#include <utility>
 
 #pragma comment(lib, "winhttp.lib")
 
@@ -38,6 +40,7 @@
 // Note: Link with lhwm-cpp-wrapper.lib and mscoree.lib for LibreHardwareMonitor support
 
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "lhwm-cpp-wrapper.h"
 #include <tuple>
 #include "imgui_impl_win32.h"
@@ -52,9 +55,10 @@
 #define IDM_SHOW      1003
 #define IDM_HIDE      1004
 #define IDM_UPDATE    1005
+#define IDM_RESET_POS 1006
 
 // Current version
-#define APP_VERSION "v1.4.1-beta"
+#define APP_VERSION "v1.5.0-beta"
 
 // PawnIO installer resource ID (embedded executable)
 #define IDR_PAWNIO_SETUP 101
@@ -99,13 +103,21 @@ static const char* ETW_SESSION_NAME = "FPSOverlay_ETW";
 // ═══════════════════════════════════════════════════════════════════════════
 // Configuration
 // ═══════════════════════════════════════════════════════════════════════════
+// Layout: 0 = vertical stack, 1 = horizontal compact, 2 = Steam-style performance bar
+#define LAYOUT_VERTICAL   0
+#define LAYOUT_HORIZONTAL 1
+#define LAYOUT_STEAM      2
+
+#define FREQ_PATH_MAX   260
+#define FREQ_SPARK_LEN  48
+
 struct OverlayConfig {
     bool showFPS  = true;
     bool showCPU  = true;
     bool showGPU  = true;
     bool showVRAM = true;     // GPU VRAM usage
     bool showRAM  = true;
-    bool horizontal = false;  // horizontal compact view
+    int  layoutStyle = LAYOUT_VERTICAL;
     bool useFahrenheit = false; // false = Celsius, true = Fahrenheit
     bool autoStart = false;   // skip config window and start overlay immediately
     int  position = 0;        // 0=TL  1=TR  2=BL  3=BR
@@ -115,18 +127,25 @@ struct OverlayConfig {
     float customX = -1.0f;    // custom position (-1 = use corner preset)
     float customY = -1.0f;
     int  selectedGpu = 0;     // selected GPU index (0 = first GPU)
+    int  steamBarScale = 100; // Steam-like layout size only: 50..200 (%), 100 = match vertical/horizontal text scale
+    bool showCpuFreq = false;
+    bool showGpuCoreFreq = false;
+    char cpuFreqPath[FREQ_PATH_MAX] = "";
+    char gpuCoreFreqPath[FREQ_PATH_MAX] = "";
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
 // GPU list (for multi-GPU support via LHWM)
 // ═══════════════════════════════════════════════════════════════════════════
 #define MAX_GPUS 8
+
 struct GpuInfo {
     char name[256];
     std::string tempPath;      // LHWM sensor path for temperature
     std::string loadPath;      // LHWM sensor path for GPU load
     std::string vramUsedPath;  // LHWM sensor path for VRAM used
     std::string vramTotalPath; // LHWM sensor path for VRAM total
+    std::vector<std::pair<std::string, std::string>> coreClockOpts; // display name, path
 };
 static GpuInfo g_gpuList[MAX_GPUS];
 static int g_gpuCount = 0;
@@ -188,6 +207,18 @@ static void WriteIniFloat(const char* section, const char* key, float value)
     WritePrivateProfileStringA(section, key, buf, g_configPath);
 }
 
+static void ReadIniStr(const char* section, const char* key, char* out, size_t cap)
+{
+    if (!cap) return;
+    GetPrivateProfileStringA(section, key, "", out, (DWORD)cap, g_configPath);
+    out[cap - 1] = '\0';
+}
+
+static void WriteIniStr(const char* section, const char* key, const char* value)
+{
+    WritePrivateProfileStringA(section, key, value ? value : "", g_configPath);
+}
+
 static void LoadConfig(OverlayConfig& cfg)
 {
     InitConfigPath();
@@ -205,15 +236,28 @@ static void LoadConfig(OverlayConfig& cfg)
     cfg.showGPU       = ReadIniInt("Display", "showGPU", 1) != 0;
     cfg.showVRAM      = ReadIniInt("Display", "showVRAM", 1) != 0;
     cfg.showRAM       = ReadIniInt("Display", "showRAM", 1) != 0;
+
+    cfg.showCpuFreq     = ReadIniInt("Frequency", "showCpuFreq", 0) != 0;
+    cfg.showGpuCoreFreq = ReadIniInt("Frequency", "showGpuCoreFreq", 0) != 0;
+    ReadIniStr("Frequency", "cpuFreqPath", cfg.cpuFreqPath, sizeof(cfg.cpuFreqPath));
+    ReadIniStr("Frequency", "gpuCoreFreqPath", cfg.gpuCoreFreqPath, sizeof(cfg.gpuCoreFreqPath));
     
-    // Layout settings
-    cfg.horizontal    = ReadIniInt("Layout", "horizontal", 0) != 0;
+    // Layout settings (migrate old horizontal=1 -> layoutStyle=1)
+    {
+        int ls = ReadIniInt("Layout", "layoutStyle", -1);
+        if (ls < 0)
+            ls = ReadIniInt("Layout", "horizontal", 0) ? LAYOUT_HORIZONTAL : LAYOUT_VERTICAL;
+        if (ls < LAYOUT_VERTICAL || ls > LAYOUT_STEAM)
+            ls = LAYOUT_VERTICAL;
+        cfg.layoutStyle = ls;
+    }
     cfg.useFahrenheit = ReadIniInt("Layout", "useFahrenheit", 0) != 0;
     cfg.autoStart     = ReadIniInt("Layout", "autoStart", 0) != 0;
     cfg.position      = ReadIniInt("Layout", "position", 0);
     cfg.opacity       = ReadIniInt("Layout", "opacity", 85);
     cfg.customX       = ReadIniFloat("Layout", "customX", -1.0f);
     cfg.customY       = ReadIniFloat("Layout", "customY", -1.0f);
+    cfg.steamBarScale = ReadIniInt("Layout", "steamBarScale", 100);
     
     // Hotkeys
     cfg.toggleKey     = ReadIniInt("Hotkeys", "toggleKey", VK_INSERT);
@@ -227,6 +271,10 @@ static void LoadConfig(OverlayConfig& cfg)
     if (cfg.opacity < 30) cfg.opacity = 30;
     if (cfg.opacity > 100) cfg.opacity = 100;
     if (cfg.selectedGpu < 0) cfg.selectedGpu = 0;
+    if (cfg.layoutStyle < LAYOUT_VERTICAL || cfg.layoutStyle > LAYOUT_STEAM)
+        cfg.layoutStyle = LAYOUT_VERTICAL;
+    if (cfg.steamBarScale < 50) cfg.steamBarScale = 50;
+    if (cfg.steamBarScale > 200) cfg.steamBarScale = 200;
 }
 
 // Check if welcome message has been shown (separate from config)
@@ -277,15 +325,22 @@ static void SaveConfig(const OverlayConfig& cfg)
     WriteIniInt("Display", "showGPU", cfg.showGPU ? 1 : 0);
     WriteIniInt("Display", "showVRAM", cfg.showVRAM ? 1 : 0);
     WriteIniInt("Display", "showRAM", cfg.showRAM ? 1 : 0);
+
+    WriteIniInt("Frequency", "showCpuFreq", cfg.showCpuFreq ? 1 : 0);
+    WriteIniInt("Frequency", "showGpuCoreFreq", cfg.showGpuCoreFreq ? 1 : 0);
+    WriteIniStr("Frequency", "cpuFreqPath", cfg.cpuFreqPath);
+    WriteIniStr("Frequency", "gpuCoreFreqPath", cfg.gpuCoreFreqPath);
     
     // Layout settings
-    WriteIniInt("Layout", "horizontal", cfg.horizontal ? 1 : 0);
+    WriteIniInt("Layout", "layoutStyle", cfg.layoutStyle);
+    WriteIniInt("Layout", "horizontal", cfg.layoutStyle == LAYOUT_HORIZONTAL ? 1 : 0);
     WriteIniInt("Layout", "useFahrenheit", cfg.useFahrenheit ? 1 : 0);
     WriteIniInt("Layout", "autoStart", cfg.autoStart ? 1 : 0);
     WriteIniInt("Layout", "position", cfg.position);
     WriteIniInt("Layout", "opacity", cfg.opacity);
     WriteIniFloat("Layout", "customX", cfg.customX);
     WriteIniFloat("Layout", "customY", cfg.customY);
+    WriteIniInt("Layout", "steamBarScale", cfg.steamBarScale);
     
     // Hotkeys
     WriteIniInt("Hotkeys", "toggleKey", cfg.toggleKey);
@@ -312,6 +367,7 @@ static HWND           g_hwnd     = nullptr;
 static NOTIFYICONDATA g_nid      = {};
 static RECT           g_overlayBounds = {0, 0, 0, 0};  // ImGui overlay bounds for hit-testing
 static bool           g_isDragging = false;            // True when user is dragging the overlay
+static bool           g_overlayForceCornerSnap = false; // one shot: snap to corner preset (after Reset Position)
 
 // ── Hardware info ──
 static char g_cpuName[256] = "Unknown";
@@ -431,6 +487,102 @@ static std::string g_lhwmGpuLoadPath;      // e.g., "/gpu-nvidia/0/load/0"
 static std::string g_lhwmGpuVramUsedPath;  // VRAM used
 static std::string g_lhwmGpuVramTotalPath; // VRAM total
 static float g_lhwmCpuTemp = 0.0f;         // CPU temp from LHWM (used directly)
+
+// CPU / GPU core clock options and live values (MHz) + sparkline history
+static std::vector<std::pair<std::string, std::string>> g_cpuClockOpts;
+static float g_cpuClockMHz = 0.f;
+static float g_gpuCoreClockMHz = 0.f;
+static float g_cpuSpark[FREQ_SPARK_LEN];
+static int   g_cpuSparkN = 0;
+static float g_gpuSpark[FREQ_SPARK_LEN];
+static int   g_gpuSparkN = 0;
+
+static bool FreqPathValid(const char* p, const std::vector<std::pair<std::string, std::string>>& opts)
+{
+    if (!p || !p[0]) return false;
+    for (const auto& e : opts)
+        if (e.second == p) return true;
+    return false;
+}
+
+static void ValidateFrequencyPaths()
+{
+    if (!FreqPathValid(g_Config.cpuFreqPath, g_cpuClockOpts))
+        g_Config.cpuFreqPath[0] = '\0';
+    if (g_gpuCount > 0 && g_Config.selectedGpu >= 0 && g_Config.selectedGpu < g_gpuCount) {
+        GpuInfo& g = g_gpuList[g_Config.selectedGpu];
+        if (!FreqPathValid(g_Config.gpuCoreFreqPath, g.coreClockOpts))
+            g_Config.gpuCoreFreqPath[0] = '\0';
+    } else {
+        g_Config.gpuCoreFreqPath[0] = '\0';
+    }
+}
+
+static void SparkPush(float* buf, int& n, int cap, float v)
+{
+    if (cap <= 0) return;
+    if (n < cap)
+        buf[n++] = v;
+    else {
+        memmove(buf, buf + 1, (size_t)(cap - 1) * sizeof(float));
+        buf[cap - 1] = v;
+    }
+}
+
+static void PollClockSensors()
+{
+    if (!g_lhwmAvailable) return;
+    try {
+        if (g_Config.showCpuFreq && g_Config.cpuFreqPath[0])
+            g_cpuClockMHz = LHWM::GetSensorValue(std::string(g_Config.cpuFreqPath));
+        else
+            g_cpuClockMHz = 0.f;
+
+        if (g_Config.showGpuCoreFreq && g_Config.gpuCoreFreqPath[0])
+            g_gpuCoreClockMHz = LHWM::GetSensorValue(std::string(g_Config.gpuCoreFreqPath));
+        else
+            g_gpuCoreClockMHz = 0.f;
+
+        SparkPush(g_cpuSpark, g_cpuSparkN, FREQ_SPARK_LEN, g_cpuClockMHz > 0.f ? g_cpuClockMHz : 0.f);
+        SparkPush(g_gpuSpark, g_gpuSparkN, FREQ_SPARK_LEN, g_gpuCoreClockMHz > 0.f ? g_gpuCoreClockMHz : 0.f);
+    } catch (...) {
+    }
+}
+
+static void DrawMiniSpark(const char* id, const float* hist, int n, float mhz, ImVec2 sz)
+{
+    if (n >= 2) {
+        ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(0.33f, 0.82f, 0.52f, 1.f));
+        ImGui::PlotLines(id, hist, n, 0, nullptr, FLT_MAX, FLT_MAX, sz);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+    }
+    if (mhz > 0.f)
+        ImGui::TextColored(ImVec4(.72f, .72f, .76f, 1), "%.0f MHz", mhz);
+    else
+        ImGui::TextColored(ImVec4(.45f, .45f, .50f, 1), "--- MHz");
+}
+
+// Inline spark + MHz for horizontal / Steam rows: ImGui SameLine top-aligns widgets, so we
+// vertically center the framed PlotLines and the Text block against each other.
+static void InlineFreqSparkMHz(const char* plotId, const float* hist, int n, float mhz,
+                               ImVec2 plotInnerPx, float gapAfterPlot, const ImVec4& txtCol)
+{
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, 2.f));
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float plotFrameH = plotInnerPx.y + st.FramePadding.y * 2.f;
+    const float textH = ImGui::GetTextLineHeight();
+    const float rowH = plotFrameH > textH ? plotFrameH : textH;
+    const float rowTop = ImGui::GetCursorPosY();
+    ImGui::SetCursorPosY(rowTop + (rowH - plotFrameH) * 0.5f);
+    ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(0.33f, 0.82f, 0.52f, 1.f));
+    ImGui::PlotLines(plotId, hist, n, 0, nullptr, FLT_MAX, FLT_MAX, plotInnerPx);
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+    ImGui::SameLine(0, gapAfterPlot);
+    ImGui::SetCursorPosY(rowTop + (rowH - textH) * 0.5f);
+    ImGui::TextColored(txtCol, "%.0f MHz", mhz);
+}
 
 // ── DX11 ──
 static ID3D11Device*           g_pd3dDevice        = nullptr;
@@ -909,11 +1061,30 @@ static int FindGpuByName(const char* name) {
     return -1;
 }
 
+static bool IsGpuMemoryClockSensor(const std::string& name)
+{
+    std::string n;
+    n.reserve(name.size());
+    for (char c : name)
+        n += (char)tolower((unsigned char)c);
+    if (n.find("memory") != std::string::npos && n.find("clock") != std::string::npos)
+        return true;
+    if (n.find("hbm") != std::string::npos)
+        return true;
+    if (n.find("vram") != std::string::npos && n.find("clock") != std::string::npos)
+        return true;
+    return false;
+}
+
 static bool InitLHWM()
 {
     try {
         auto sensors = LHWM::GetHardwareSensorMap();
         if (sensors.empty()) return false;
+
+        g_cpuClockOpts.clear();
+        for (int gi = 0; gi < MAX_GPUS; gi++)
+            g_gpuList[gi].coreClockOpts.clear();
         
         // The map structure from lhwm-cpp-wrapper is:
         // Key (map key) = Hardware name (e.g., "AMD Ryzen 9 5900HS...")
@@ -1016,6 +1187,26 @@ static bool InitLHWM()
                             g_gpuList[gpuIndex].vramTotalPath = sensorPath;
                         }
                     }
+                    else if (sensorType == "Clock") {
+                        // VRAM/memory clocks are inconsistent in LHWM; only list GPU core clocks.
+                        if (IsGpuMemoryClockSensor(sensorName))
+                            continue;
+                        bool dup = false;
+                        for (const auto& e : g_gpuList[gpuIndex].coreClockOpts)
+                            if (e.second == sensorPath) { dup = true; break; }
+                        if (!dup)
+                            g_gpuList[gpuIndex].coreClockOpts.push_back({ sensorName, sensorPath });
+                    }
+                }
+
+                if (sensorType == "Clock") {
+                    if ((isCpuHardware || isCpuPath) && !isGpuPath) {
+                        bool dup = false;
+                        for (const auto& e : g_cpuClockOpts)
+                            if (e.second == sensorPath) { dup = true; break; }
+                        if (!dup)
+                            g_cpuClockOpts.push_back({ sensorName, sensorPath });
+                    }
                 }
             }
         }
@@ -1039,6 +1230,8 @@ static bool InitLHWM()
             g_lhwmGpuVramTotalPath = g_gpuList[idx].vramTotalPath;
             snprintf(g_gpuName, sizeof(g_gpuName), "%s", g_gpuList[idx].name);
         }
+
+        ValidateFrequencyPaths();
         
         return !g_lhwmCpuTempPath.empty() || g_gpuCount > 0;
     }
@@ -1091,6 +1284,8 @@ static void SelectGpu(int index)
     g_lhwmGpuVramTotalPath = g_gpuList[index].vramTotalPath;
     
     snprintf(g_gpuName, sizeof(g_gpuName), "%s", g_gpuList[index].name);
+
+    ValidateFrequencyPaths();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1471,7 +1666,11 @@ void SwitchToOverlay()
     ShutdownBackends();
     DestroyWindow(g_hwnd);
 
-    int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
+    // Cover the monitor work area only (excludes taskbar) so the topmost overlay does not hide it.
+    RECT wa;
+    SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0);
+    const int w = wa.right - wa.left;
+    const int h = wa.bottom - wa.top;
     
     // Always start click-through - we toggle it when CTRL is held
     DWORD exStyle = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
@@ -1479,7 +1678,7 @@ void SwitchToOverlay()
     g_hwnd = CreateWindowEx(
         exStyle,
         "FPSOverlay", "FPS Overlay", WS_POPUP,
-        0, 0, w, h, nullptr, nullptr, g_hInstance, nullptr);
+        wa.left, wa.top, w, h, nullptr, nullptr, g_hInstance, nullptr);
 
     SetLayeredWindowAttributes(g_hwnd, RGB(0,0,0), 255, LWA_ALPHA);
     MARGINS m = { -1 }; DwmExtendFrameIntoClientArea(g_hwnd, &m);
@@ -1502,7 +1701,7 @@ void SwitchToConfig()
     ShutdownBackends();
     DestroyWindow(g_hwnd);
 
-    int cw = 420, ch = 680;
+    int cw = 420, ch = 820;
     int cx = (GetSystemMetrics(SM_CXSCREEN) - cw) / 2;
     int cy = (GetSystemMetrics(SM_CYSCREEN) - ch) / 2;
     g_hwnd = CreateWindowEx(0, "FPSOverlay", "FPS Overlay",
@@ -1533,6 +1732,26 @@ static ImVec4 ColorByLoad(float v, float warn = 70, float crit = 90)
     if (v > crit) return ImVec4(1,.3f,.3f,1);
     if (v > warn) return ImVec4(1,.85f,.15f,1);
     return ImVec4(.70f,.70f,.75f,1);
+}
+
+// Word-wrap tooltip text so it fits narrow settings windows
+static void TooltipWrapped(const char* text)
+{
+    ImGui::BeginTooltip();
+    ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + 260.f);
+    ImGui::TextUnformatted(text);
+    ImGui::PopTextWrapPos();
+    ImGui::EndTooltip();
+}
+
+static void TooltipWrappedFmt(const char* fmt, ...)
+{
+    char buf[640];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    TooltipWrapped(buf);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1568,7 +1787,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     RegisterClassEx(&wc);
 
     // ── Config window ──
-    int cw = 420, ch = 680;
+    int cw = 420, ch = 820;
     int cx = (GetSystemMetrics(SM_CXSCREEN) - cw) / 2;
     int cy = (GetSystemMetrics(SM_CYSCREEN) - ch) / 2;
     g_hwnd = CreateWindowEx(0, wc.lpszClassName, "FPS Overlay",
@@ -1716,9 +1935,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         nullptr, nullptr, SW_SHOWNORMAL);
                 }
                 ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Click to download %s", g_latestVersion);
-                }
+                if (ImGui::IsItemHovered())
+                    TooltipWrappedFmt("Click to download %s", g_latestVersion);
             }
 
             // Developer text
@@ -1779,6 +1997,65 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 }
             }
 
+            // ── FREQUENCY (sparklines; LHWM clock sensors) ──
+            ImGui::Spacing(); ImGui::Spacing();
+            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "FREQUENCY");
+            ImGui::Spacing();
+            if (!g_lhwmAvailable) {
+                ImGui::TextColored(ImVec4(.55f,.55f,.58f,1), "Requires LibreHardwareMonitor.");
+            } else {
+                ImGui::Checkbox("  Show CPU frequency", &g_Config.showCpuFreq);
+                if (g_Config.showCpuFreq) {
+                    ImGui::Indent();
+                    const char* cpuPrev = "(select sensor)";
+                    for (const auto& o : g_cpuClockOpts) {
+                        if (strcmp(g_Config.cpuFreqPath, o.second.c_str()) == 0) {
+                            cpuPrev = o.first.c_str();
+                            break;
+                        }
+                    }
+                    ImGui::SetNextItemWidth(-1);
+                    if (ImGui::BeginCombo("##cpuclkcombo", cpuPrev)) {
+                        for (const auto& o : g_cpuClockOpts) {
+                            bool isSel = (strcmp(g_Config.cpuFreqPath, o.second.c_str()) == 0);
+                            if (ImGui::Selectable(o.first.c_str(), isSel))
+                                snprintf(g_Config.cpuFreqPath, sizeof(g_Config.cpuFreqPath), "%s", o.second.c_str());
+                            if (isSel) ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                    if (g_cpuClockOpts.empty())
+                        ImGui::TextColored(ImVec4(.85f,.45f,.35f,1), "  No CPU clock sensors found.");
+                    ImGui::Unindent();
+                }
+
+                ImGui::Checkbox("  Show GPU core frequency", &g_Config.showGpuCoreFreq);
+                if (g_Config.showGpuCoreFreq && g_gpuCount > 0) {
+                    ImGui::Indent();
+                    GpuInfo& gg = g_gpuList[g_Config.selectedGpu];
+                    const char* gpPrev = "(select sensor)";
+                    for (const auto& o : gg.coreClockOpts) {
+                        if (strcmp(g_Config.gpuCoreFreqPath, o.second.c_str()) == 0) {
+                            gpPrev = o.first.c_str();
+                            break;
+                        }
+                    }
+                    ImGui::SetNextItemWidth(-1);
+                    if (ImGui::BeginCombo("##gpclkcombo", gpPrev)) {
+                        for (const auto& o : gg.coreClockOpts) {
+                            bool isSel = (strcmp(g_Config.gpuCoreFreqPath, o.second.c_str()) == 0);
+                            if (ImGui::Selectable(o.first.c_str(), isSel))
+                                snprintf(g_Config.gpuCoreFreqPath, sizeof(g_Config.gpuCoreFreqPath), "%s", o.second.c_str());
+                            if (isSel) ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                    if (gg.coreClockOpts.empty())
+                        ImGui::TextColored(ImVec4(.85f,.45f,.35f,1), "  No GPU core clock sensors for this GPU.");
+                    ImGui::Unindent();
+                }
+            }
+
             // ── POSITION ──
             ImGui::Spacing(); ImGui::Spacing();
             ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "POSITION");
@@ -1800,7 +2077,34 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::Spacing(); ImGui::Spacing();
             ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "LAYOUT");
             ImGui::Spacing();
-            ImGui::Checkbox("  Horizontal Compact View", &g_Config.horizontal);
+            ImGui::RadioButton("  Vertical (default)", &g_Config.layoutStyle, LAYOUT_VERTICAL);
+            ImGui::RadioButton("  Horizontal compact", &g_Config.layoutStyle, LAYOUT_HORIZONTAL);
+            ImGui::RadioButton("  Steam-like bar", &g_Config.layoutStyle, LAYOUT_STEAM);
+            if (ImGui::IsItemHovered())
+                TooltipWrapped(
+                    "Black bar with Steam-style FPS / CPU / GPU labels.\n"
+                    "Same stats as horizontal compact (temps, VRAM/RAM detail, process name).\n"
+                    "At 100% size, text matches vertical/horizontal scale.");
+            if (g_Config.layoutStyle == LAYOUT_STEAM) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "Steam bar size");
+                ImGui::Spacing();
+                ImGui::SetNextItemWidth(-1);
+                ImGui::SliderInt("##steamscale", &g_Config.steamBarScale, 50, 200, "%d%%");
+                if (ImGui::IsItemHovered())
+                    TooltipWrapped(
+                        "100% matches the default font size used in vertical and horizontal layouts.\n"
+                        "Hold CTRL over the bar (including padding) and drag to move.");
+            } else {
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "Overlay opacity");
+                ImGui::Spacing();
+                ImGui::SetNextItemWidth(-1);
+                ImGui::SliderInt("##opac", &g_Config.opacity, 30, 100, "%d%%");
+                if (ImGui::IsItemHovered())
+                    TooltipWrapped(
+                        "Steam-like layout uses a solid bar; opacity applies when you switch back to vertical or horizontal.");
+            }
             
             // ── TEMPERATURE UNIT ──
             ImGui::Spacing(); ImGui::Spacing();
@@ -1810,13 +2114,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             if (ImGui::RadioButton("Celsius", &tempUnit, 0)) g_Config.useFahrenheit = false;
             ImGui::SameLine(0,24);
             if (ImGui::RadioButton("Fahrenheit", &tempUnit, 1)) g_Config.useFahrenheit = true;
-
-            // ── OPACITY ──
-            ImGui::Spacing(); ImGui::Spacing();
-            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "OPACITY");
-            ImGui::Spacing();
-            ImGui::SetNextItemWidth(-1);
-            ImGui::SliderInt("##opac", &g_Config.opacity, 30, 100, "%d%%");
 
             // ── HOTKEYS ──
             ImGui::Spacing(); ImGui::Spacing();
@@ -1855,7 +2152,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::Spacing();
             ImGui::Checkbox("  Start overlay immediately", &g_Config.autoStart);
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Skip this window and start the overlay directly next time");
+                TooltipWrapped("Skip this window and start the overlay directly next time");
 
             // ── HARDWARE ──
             ImGui::Spacing(); ImGui::Spacing();
@@ -1970,6 +2267,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 GlobalMemoryStatusEx(&mem);
                 cachedRamUsed  = (float)(mem.ullTotalPhys - mem.ullAvailPhys) / (1024.f*1024.f*1024.f);
                 cachedRamTotal = (float)(mem.ullTotalPhys)                    / (1024.f*1024.f*1024.f);
+
+                static auto lastClkPoll = Clock::now();
+                float clkDt = std::chrono::duration<float>(now - lastClkPoll).count();
+                if (clkDt >= 0.12f) {
+                    lastClkPoll = now;
+                    PollClockSensors();
+                }
             }
             
             // Use cached values (updated when not dragging)
@@ -2038,6 +2342,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             if (ctrlHeld && rightMouseJustPressed) {
                 HMENU m = CreatePopupMenu();
                 AppendMenu(m, MF_STRING, IDM_HIDE, "Hide Overlay");
+                AppendMenu(m, MF_STRING, IDM_RESET_POS, "Reset Position");
                 AppendMenu(m, MF_SEPARATOR, 0, nullptr);
                 AppendMenu(m, MF_STRING, IDM_SETTINGS, "Settings");
                 AppendMenu(m, MF_STRING, IDM_EXIT, "Exit");
@@ -2046,7 +2351,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                                          cursorPt.x, cursorPt.y, 0, g_hwnd, nullptr);
                 DestroyMenu(m);
                 switch (cmd) {
-                    case IDM_HIDE:     g_OvlVisible = false;           break;
+                    case IDM_HIDE:       g_OvlVisible = false;           break;
+                    case IDM_RESET_POS:
+                        g_Config.customX = -1.f;
+                        g_Config.customY = -1.f;
+                        g_overlayForceCornerSnap = true;
+                        SaveConfig(g_Config);
+                        break;
                     case IDM_SETTINGS: g_Pending = CMD_SHOW_SETTINGS;  break;
                     case IDM_EXIT:     g_Pending = CMD_EXIT;           break;
                 }
@@ -2059,8 +2370,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
             // Position: use custom if set, otherwise use corner preset
             // IMPORTANT: Don't set position during interaction mode - let ImGui handle dragging
-            float margin = 16;
-            int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+            float margin = (g_Config.layoutStyle == LAYOUT_STEAM) ? 0.f : 16.f;
+            RECT work{};
+            SystemParametersInfo(SPI_GETWORKAREA, 0, &work, 0);
+            const float wx = (float)work.left;
+            const float wy = (float)work.top;
+            const float sw = (float)(work.right - work.left);
+            const float sh = (float)(work.bottom - work.top);
             ImVec2 pos, pivot = {0, 0};
             bool hasCustomPos = (g_Config.customX >= 0 && g_Config.customY >= 0);
             
@@ -2068,21 +2384,27 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 // User has dragged the overlay - use their position
                 pos = ImVec2(g_Config.customX, g_Config.customY);
             } else {
-                // Use corner preset
+                // Use corner preset (coordinates within primary monitor work area)
                 switch (g_Config.position) {
                     default:
-                    case 0: pos={margin,margin};        pivot={0,0}; break;
-                    case 1: pos={sw-margin,margin};     pivot={1,0}; break;
-                    case 2: pos={margin,sh-margin};     pivot={0,1}; break;
-                    case 3: pos={sw-margin,sh-margin};  pivot={1,1}; break;
+                    case 0: pos = ImVec2(wx + margin,       wy + margin);       pivot = {0, 0}; break;
+                    case 1: pos = ImVec2(wx + sw - margin, wy + margin);       pivot = {1, 0}; break;
+                    case 2: pos = ImVec2(wx + margin,       wy + sh - margin); pivot = {0, 1}; break;
+                    case 3: pos = ImVec2(wx + sw - margin, wy + sh - margin); pivot = {1, 1}; break;
                 }
             }
             
             // Only set position when NOT in interaction mode to avoid fighting with ImGui's drag
             // - When not interacting: set position (either corner preset or saved custom position)
             // - When interacting (ctrlHeld): let ImGui manage position freely for smooth dragging
-            if (!ctrlHeld) {
-                ImGui::SetNextWindowPos(pos, hasCustomPos ? ImGuiCond_Once : ImGuiCond_Always, pivot);
+            // - g_overlayForceCornerSnap: after "Reset Position" menu, snap to corner even if CTRL still held
+            {
+                bool forceSnap = g_overlayForceCornerSnap;
+                if (forceSnap)
+                    g_overlayForceCornerSnap = false;
+                if (!ctrlHeld || forceSnap) {
+                    ImGui::SetNextWindowPos(pos, hasCustomPos ? ImGuiCond_Once : ImGuiCond_Always, pivot);
+                }
             }
             
             // Full opacity when CTRL held, otherwise user setting
@@ -2097,6 +2419,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             
             if (!ctrlHeld) {
                 wf |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs;
+            }
+
+            if (g_Config.layoutStyle == LAYOUT_STEAM) {
+                const float steamSs = g_Config.steamBarScale / 100.f;
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f * steamSs, 6.f * steamSs));
+                ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.f * steamSs, 2.f * steamSs));
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
+                ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.f, 0.f, 0.f, 1.f));
+                ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.22f, 0.22f, 0.24f, 0.f));
             }
 
             ImGui::Begin("##ovl", nullptr, wf);
@@ -2147,9 +2479,152 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             }
 
             // ═══════════════════════════════════════════════════════════
+            // STEAM-LIKE BAR (same stats as horizontal: FPS, CPU+temp, GPU+temp, VRAM/RAM, process line)
+            // ═══════════════════════════════════════════════════════════
+            if (g_Config.layoutStyle == LAYOUT_STEAM) {
+                const float ss = g_Config.steamBarScale / 100.f;
+                const float hs = 4.f * ss;
+                const float hsTight = 3.f * ss;
+
+                const ImVec4 labFps(0.92f, 0.52f, 0.58f, 1.f);  // muted pink-red (Steam-style label)
+                const ImVec4 labCpu(0.94f, 0.88f, 0.58f, 1.f);  // pale yellow
+                const ImVec4 labGpu(0.52f, 0.90f, 0.70f, 1.f);  // mint green
+                const ImVec4 sepC(0.55f, 0.55f, 0.58f, 1.f);
+
+                const bool showProcLine = g_Config.showFPS && g_targetProcessName[0];
+                const float lineH = ImGui::GetTextLineHeightWithSpacing();
+
+                ImGui::SetWindowFontScale(1.0f * ss);
+
+                // Full-row hit target so CTRL+drag works on labels/values (not only padding)
+                ImVec2 steamRowStart = ImGui::GetCursorPos();
+                if (ctrlHeld) {
+                    float rowH = lineH * (showProcLine ? 2.45f : 1.55f);
+                    float rowW = ImGui::GetContentRegionAvail().x;
+                    if (rowW < 32.f)
+                        rowW = ImGui::GetWindowWidth() - ImGui::GetCursorPos().x - ImGui::GetStyle().WindowPadding.x;
+                    ImGui::InvisibleButton("##SteamBarDrag", ImVec2(rowW, rowH));
+                    ImGuiWindow* wbar = ImGui::GetCurrentWindow();
+                    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0))
+                        ImGui::StartMouseMovingWindow(wbar);
+                    ImGui::SetCursorPos(steamRowStart);
+                }
+
+                bool needSep = false;
+
+                auto FpsTierCol = [](float fps) -> ImVec4 {
+                    if (fps >= 60.f) return ImVec4(.18f, .94f, .45f, 1.f);
+                    if (fps >= 30.f) return ImVec4(1.f, .85f, .15f, 1.f);
+                    return ImVec4(1.f, .25f, .25f, 1.f);
+                };
+
+                if (g_Config.showFPS) {
+                    ImGui::TextColored(labFps, "FPS");
+                    ImGui::SameLine(0, hsTight);
+                    if (g_etwAvailable && gameFps > 0)
+                        ImGui::TextColored(FpsTierCol(gameFps), "%.0f", gameFps);
+                    else
+                        ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1.f), "---");
+                    needSep = true;
+                }
+
+                if (g_Config.showCPU) {
+                    if (needSep) {
+                        ImGui::SameLine(0, hs);
+                        ImGui::TextColored(sepC, "|");
+                        ImGui::SameLine(0, hs);
+                    }
+                    ImGui::TextColored(labCpu, "CPU");
+                    ImGui::SameLine(0, hsTight);
+                    ImGui::TextColored(ColorByLoad(cpuUsage), "%.0f%%", cpuUsage);
+                    if (g_cpuTempAvailable && g_cpuTemp > 0) {
+                        ImGui::SameLine(0, 2.f * ss);
+                        float dispTemp = ToDisplayTemp(g_cpuTemp, g_Config.useFahrenheit);
+                        ImVec4 tc = g_cpuTemp > 85 ? ImVec4(1, .3f, .3f, 1)
+                                  : g_cpuTemp > 70 ? ImVec4(1, .85f, .15f, 1)
+                                                   : ImVec4(.70f, .70f, .75f, 1);
+                        ImGui::TextColored(tc, " %.0f\xC2\xB0%s", dispTemp, g_Config.useFahrenheit ? "F" : "C");
+                    }
+                    if (g_Config.showCpuFreq && g_Config.cpuFreqPath[0] && g_lhwmAvailable) {
+                        ImGui::SameLine(0, hsTight);
+                        ImGui::TextColored(sepC, "|");
+                        ImGui::SameLine(0, hsTight);
+                        InlineFreqSparkMHz("##st_cpu", g_cpuSpark, g_cpuSparkN, g_cpuClockMHz,
+                                           ImVec2(38.f * ss, 11.f * ss), 5.f * ss, ImVec4(.75f, .75f, .78f, 1.f));
+                    }
+                    needSep = true;
+                }
+
+                if (g_Config.showGPU) {
+                    if (needSep) {
+                        ImGui::SameLine(0, hs);
+                        ImGui::TextColored(sepC, "|");
+                        ImGui::SameLine(0, hs);
+                    }
+                    float dispGpuLoad = g_gpuUsage;
+                    float dispGpuTemp = g_gpuTemp;
+                    bool hasGpuData = g_lhwmAvailable && g_gpuCount > 0;
+                    ImGui::TextColored(labGpu, "GPU");
+                    ImGui::SameLine(0, hsTight);
+                    if (hasGpuData) {
+                        ImGui::TextColored(ColorByLoad(dispGpuLoad), "%.0f%%", dispGpuLoad);
+                        if (dispGpuTemp > 0) {
+                            ImGui::SameLine(0, 2.f * ss);
+                            float dispTemp = ToDisplayTemp(dispGpuTemp, g_Config.useFahrenheit);
+                            ImVec4 tc = dispGpuTemp > 85 ? ImVec4(1, .3f, .3f, 1)
+                                      : dispGpuTemp > 70 ? ImVec4(1, .85f, .15f, 1)
+                                                         : ImVec4(.70f, .70f, .75f, 1);
+                            ImGui::TextColored(tc, " %.0f\xC2\xB0%s", dispTemp, g_Config.useFahrenheit ? "F" : "C");
+                        }
+                        if (g_Config.showGpuCoreFreq && g_Config.gpuCoreFreqPath[0] && g_lhwmAvailable) {
+                            ImGui::SameLine(0, hsTight);
+                            ImGui::TextColored(sepC, "|");
+                            ImGui::SameLine(0, hsTight);
+                            InlineFreqSparkMHz("##st_gpu", g_gpuSpark, g_gpuSparkN, g_gpuCoreClockMHz,
+                                               ImVec2(38.f * ss, 11.f * ss), 5.f * ss, ImVec4(.75f, .75f, .78f, 1.f));
+                        }
+                    } else {
+                        ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1.f), "N/A");
+                    }
+                    needSep = true;
+                }
+
+                if (g_Config.showVRAM) {
+                    float dispVramUsed = g_vramUsed;
+                    float dispVramTotal = g_vramTotal;
+                    if (dispVramTotal > 0.f) {
+                        if (needSep) {
+                            ImGui::SameLine(0, hs);
+                            ImGui::TextColored(sepC, "|");
+                            ImGui::SameLine(0, hs);
+                        }
+                        float vramPct = (dispVramUsed / dispVramTotal) * 100.0f;
+                        ImGui::TextColored(ColorByLoad(vramPct), "VRAM %.0f%% %.1f/%.0fG", vramPct, dispVramUsed, dispVramTotal);
+                        needSep = true;
+                    }
+                }
+
+                if (g_Config.showRAM) {
+                    if (needSep) {
+                        ImGui::SameLine(0, hs);
+                        ImGui::TextColored(sepC, "|");
+                        ImGui::SameLine(0, hs);
+                    }
+                    float pct = (ramUsed / ramTotal) * 100;
+                    ImGui::TextColored(ColorByLoad(pct), "RAM %.0f%% %.1f/%.0fG", pct, ramUsed, ramTotal);
+                }
+
+                if (showProcLine) {
+                    ImGui::SetWindowFontScale(0.78f * ss);
+                    ImGui::TextColored(ImVec4(.42f, .52f, .42f, 1.f), "%s", g_targetProcessName);
+                }
+
+                ImGui::SetWindowFontScale(1.0f);
+            }
+            // ═══════════════════════════════════════════════════════════
             // HORIZONTAL COMPACT VIEW
             // ═══════════════════════════════════════════════════════════
-            if (g_Config.horizontal) {
+            else if (g_Config.layoutStyle == LAYOUT_HORIZONTAL) {
                 bool needSep = false;
                 
                 // FPS
@@ -2177,6 +2652,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                                                    : ImVec4(.70f,.70f,.75f,1);
                         ImGui::TextColored(tc, " %.0f\xC2\xB0%s", dispTemp, g_Config.useFahrenheit ? "F" : "C");
                     }
+                    if (g_Config.showCpuFreq && g_Config.cpuFreqPath[0] && g_lhwmAvailable) {
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(.35f,.35f,.40f,1), " | ");
+                        ImGui::SameLine();
+                        InlineFreqSparkMHz("##hz_cpu", g_cpuSpark, g_cpuSparkN, g_cpuClockMHz,
+                                           ImVec2(52.f, 12.f), 6.f, ImVec4(.62f, .62f, .68f, 1.f));
+                    }
                     needSep = true;
                 }
                 
@@ -2197,6 +2679,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                                       : dispGpuTemp > 70 ? ImVec4(1,.85f,.15f,1)
                                                          : ImVec4(.70f,.70f,.75f,1);
                             ImGui::TextColored(tc, " %.0f\xC2\xB0%s", dispTemp, g_Config.useFahrenheit ? "F" : "C");
+                        }
+                        if (g_Config.showGpuCoreFreq && g_Config.gpuCoreFreqPath[0] && g_lhwmAvailable) {
+                            ImGui::SameLine();
+                            ImGui::TextColored(ImVec4(.35f,.35f,.40f,1), " | ");
+                            ImGui::SameLine();
+                            InlineFreqSparkMHz("##hz_gpu", g_gpuSpark, g_gpuSparkN, g_gpuCoreClockMHz,
+                                               ImVec2(52.f, 12.f), 6.f, ImVec4(.62f, .62f, .68f, 1.f));
                         }
                     } else {
                         ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "GPU N/A");
@@ -2275,6 +2764,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     ImGui::SetWindowFontScale(0.82f);
                     ImGui::TextColored(ImVec4(.42f,.42f,.48f,1), "  %s", g_cpuName);
                     ImGui::SetWindowFontScale(1.0f);
+                    if (g_Config.showCpuFreq && g_Config.cpuFreqPath[0] && g_lhwmAvailable) {
+                        ImGui::Dummy(ImVec2(0, 3));
+                        ImGui::TextColored(ImVec4(.48f,.58f,.65f,1), "CPU MHz");
+                        ImGui::SameLine();
+                        DrawMiniSpark("##vsp_cpu", g_cpuSpark, g_cpuSparkN, g_cpuClockMHz, ImVec2(130.f, 24.f));
+                    }
                     needSep = true;
                 }
 
@@ -2311,6 +2806,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     ImGui::SetWindowFontScale(0.82f);
                     ImGui::TextColored(ImVec4(.42f,.42f,.48f,1), "  %s", g_gpuName);
                     ImGui::SetWindowFontScale(1.0f);
+                    if (g_Config.showGpuCoreFreq && g_Config.gpuCoreFreqPath[0] && g_lhwmAvailable && hasGpuData) {
+                        ImGui::Dummy(ImVec2(0, 3));
+                        ImGui::TextColored(ImVec4(.48f,.58f,.65f,1), "GPU MHz");
+                        ImGui::SameLine();
+                        DrawMiniSpark("##vsp_gpu", g_gpuSpark, g_gpuSparkN, g_gpuCoreClockMHz, ImVec2(130.f, 24.f));
+                    }
                     needSep = true;
                 }
 
@@ -2329,12 +2830,21 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::Spacing();
-                ImGui::SetWindowFontScale(0.85f);
+                float helpSc = (g_Config.layoutStyle == LAYOUT_STEAM)
+                    ? (0.85f * (g_Config.steamBarScale / 100.f))
+                    : 0.85f;
+                ImGui::SetWindowFontScale(helpSc);
                 ImGui::TextColored(ImVec4(0.5f, 0.75f, 1.0f, 1.0f), "Drag to move | Right-click for menu");
                 ImGui::SetWindowFontScale(1.0f);
             }
 
             ImGui::End();
+
+            if (g_Config.layoutStyle == LAYOUT_STEAM) {
+                ImGui::PopStyleColor(2);
+                ImGui::PopStyleVar(4);
+            }
+
             Present(0, 0, 0, 0);
         }
     }
@@ -2425,6 +2935,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (ctrlHeld && PtInRect(&g_overlayBounds, pt)) {
                 HMENU m = CreatePopupMenu();
                 AppendMenu(m, MF_STRING, IDM_HIDE, "Hide Overlay");
+                AppendMenu(m, MF_STRING, IDM_RESET_POS, "Reset Position");
                 AppendMenu(m, MF_SEPARATOR, 0, nullptr);
                 AppendMenu(m, MF_STRING, IDM_SETTINGS, "Settings");
                 AppendMenu(m, MF_STRING, IDM_EXIT, "Exit");
@@ -2433,7 +2944,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
                                          pt.x, pt.y, 0, hWnd, nullptr);
                 DestroyMenu(m);
                 switch (cmd) {
-                    case IDM_HIDE:     g_OvlVisible = false;           break;
+                    case IDM_HIDE:       g_OvlVisible = false;           break;
+                    case IDM_RESET_POS:
+                        g_Config.customX = -1.f;
+                        g_Config.customY = -1.f;
+                        g_overlayForceCornerSnap = true;
+                        SaveConfig(g_Config);
+                        break;
                     case IDM_SETTINGS: g_Pending = CMD_SHOW_SETTINGS;  break;
                     case IDM_EXIT:     g_Pending = CMD_EXIT;           break;
                 }
