@@ -58,7 +58,11 @@
 #define IDM_RESET_POS 1006
 
 // Current version
-#define APP_VERSION "v1.5.0-beta"
+#define APP_VERSION "v1.5.1-beta"
+
+// Settings window: fixed outer width (px), vertical resize minimum outer height
+static const int kConfigDlgOuterW = 420;
+static const int kConfigDlgMinOuterH = 520;
 
 // PawnIO installer resource ID (embedded executable)
 #define IDR_PAWNIO_SETUP 101
@@ -117,6 +121,7 @@ struct OverlayConfig {
     bool showGPU  = true;
     bool showVRAM = true;     // GPU VRAM usage
     bool showRAM  = true;
+    bool showProcessName = true; // tracked game / process label (all layouts)
     int  layoutStyle = LAYOUT_VERTICAL;
     bool useFahrenheit = false; // false = Celsius, true = Fahrenheit
     bool autoStart = false;   // skip config window and start overlay immediately
@@ -236,6 +241,7 @@ static void LoadConfig(OverlayConfig& cfg)
     cfg.showGPU       = ReadIniInt("Display", "showGPU", 1) != 0;
     cfg.showVRAM      = ReadIniInt("Display", "showVRAM", 1) != 0;
     cfg.showRAM       = ReadIniInt("Display", "showRAM", 1) != 0;
+    cfg.showProcessName = ReadIniInt("Display", "showProcessName", 1) != 0;
 
     cfg.showCpuFreq     = ReadIniInt("Frequency", "showCpuFreq", 0) != 0;
     cfg.showGpuCoreFreq = ReadIniInt("Frequency", "showGpuCoreFreq", 0) != 0;
@@ -325,6 +331,7 @@ static void SaveConfig(const OverlayConfig& cfg)
     WriteIniInt("Display", "showGPU", cfg.showGPU ? 1 : 0);
     WriteIniInt("Display", "showVRAM", cfg.showVRAM ? 1 : 0);
     WriteIniInt("Display", "showRAM", cfg.showRAM ? 1 : 0);
+    WriteIniInt("Display", "showProcessName", cfg.showProcessName ? 1 : 0);
 
     WriteIniInt("Frequency", "showCpuFreq", cfg.showCpuFreq ? 1 : 0);
     WriteIniInt("Frequency", "showGpuCoreFreq", cfg.showGpuCoreFreq ? 1 : 0);
@@ -1240,6 +1247,20 @@ static bool InitLHWM()
     }
 }
 
+static std::atomic<bool> g_lhwmInitFinished{false};
+
+static void LhwmBackgroundInitThread()
+{
+    bool ok = false;
+    try {
+        ok = InitLHWM();
+    } catch (...) {
+        ok = false;
+    }
+    g_lhwmAvailable = ok;
+    g_lhwmInitFinished.store(true, std::memory_order_release);
+}
+
 static void PollLHWMStats()
 {
     if (!g_lhwmAvailable) return;
@@ -1701,12 +1722,12 @@ void SwitchToConfig()
     ShutdownBackends();
     DestroyWindow(g_hwnd);
 
-    int cw = 420, ch = 820;
-    int cx = (GetSystemMetrics(SM_CXSCREEN) - cw) / 2;
+    const int ch = 820;
+    int cx = (GetSystemMetrics(SM_CXSCREEN) - kConfigDlgOuterW) / 2;
     int cy = (GetSystemMetrics(SM_CYSCREEN) - ch) / 2;
     g_hwnd = CreateWindowEx(0, "FPSOverlay", "FPS Overlay",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        cx, cy, cw, ch, nullptr, nullptr, g_hInstance, nullptr);
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME,
+        cx, cy, kConfigDlgOuterW, ch, nullptr, nullptr, g_hInstance, nullptr);
 
     InitBackends();
     ShowWindow(g_hwnd, SW_SHOW);
@@ -1786,13 +1807,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     wc.lpszClassName = "FPSOverlay";
     RegisterClassEx(&wc);
 
-    // ── Config window ──
-    int cw = 420, ch = 820;
-    int cx = (GetSystemMetrics(SM_CXSCREEN) - cw) / 2;
+    // ── Config window (fixed width; vertically resizable via WM_GETMINMAXINFO) ──
+    const int ch = 820;
+    int cx = (GetSystemMetrics(SM_CXSCREEN) - kConfigDlgOuterW) / 2;
     int cy = (GetSystemMetrics(SM_CYSCREEN) - ch) / 2;
     g_hwnd = CreateWindowEx(0, wc.lpszClassName, "FPS Overlay",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        cx, cy, cw, ch, nullptr, nullptr, hInst, nullptr);
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME,
+        cx, cy, kConfigDlgOuterW, ch, nullptr, nullptr, hInst, nullptr);
     if (!g_hwnd) return 1;
 
     // ── Check admin privileges (app should always run as admin via manifest) ──
@@ -1815,21 +1836,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         // If user declined, we still try to initialize - some features may work
     }
     
-    // Initialize LibreHardwareMonitor for GPU and CPU temperature monitoring
-    // Supports NVIDIA, AMD, and Intel GPUs
-    g_lhwmAvailable = InitLHWM();
+    // LibreHardwareMonitor init can take several seconds — run it on a detached thread
+    // so the settings UI appears immediately. Poll paths once g_lhwmInitFinished is set.
+    g_lhwmAvailable = false;
+    g_lhwmInitFinished.store(false, std::memory_order_relaxed);
+    std::thread(LhwmBackgroundInitThread).detach();
     
-    // Try WMI for CPU temperature as fallback
+    // Try WMI for CPU temperature as fallback (LHWM may enable CPU temp when init completes)
     g_cpuTempAvailable = InitWMI();
     if (g_cpuTempAvailable) {
-        // Test if we can actually get a temperature reading
         float testTemp = QueryCpuTemperature();
         g_cpuTempAvailable = (testTemp > 0.0f && testTemp < 150.0f);
-    }
-    
-    // LHWM provides CPU temp, so mark as available if we have it
-    if (g_lhwmAvailable && !g_lhwmCpuTempPath.empty()) {
-        g_cpuTempAvailable = true;
     }
 
     // Show config window (unless auto-start is enabled)
@@ -1876,6 +1893,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             if (msg.message == WM_QUIT) g_Running = false;
         }
         if (!g_Running) break;
+
+        static bool s_appliedLhwmCpuTempLift = false;
+        if (g_lhwmInitFinished.load(std::memory_order_acquire) && !s_appliedLhwmCpuTempLift) {
+            s_appliedLhwmCpuTempLift = true;
+            if (g_lhwmAvailable && !g_lhwmCpuTempPath.empty())
+                g_cpuTempAvailable = true;
+        }
 
         // ══════════════════════════════════════════════════════════════
         // CONFIG MODE
@@ -1956,16 +1980,25 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             }
             ImGui::Checkbox("  CPU Usage & Temp", &g_Config.showCPU);
             ImGui::Checkbox("  GPU Usage & Temp", &g_Config.showGPU);
-            if (!g_lhwmAvailable || g_gpuCount == 0) {
+            if (!g_lhwmInitFinished.load(std::memory_order_acquire)) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(.55f,.55f,.58f,1), "(loading…)");
+            } else if (!g_lhwmAvailable || g_gpuCount == 0) {
                 ImGui::SameLine();
                 ImGui::TextColored(ImVec4(.9f,.4f,.2f,1), "(unavailable)");
             }
             ImGui::Checkbox("  GPU VRAM Usage", &g_Config.showVRAM);
-            if (!g_lhwmAvailable || g_gpuCount == 0) {
+            if (!g_lhwmInitFinished.load(std::memory_order_acquire)) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(.55f,.55f,.58f,1), "(loading…)");
+            } else if (!g_lhwmAvailable || g_gpuCount == 0) {
                 ImGui::SameLine();
                 ImGui::TextColored(ImVec4(.9f,.4f,.2f,1), "(unavailable)");
             }
             ImGui::Checkbox("  RAM Usage", &g_Config.showRAM);
+            ImGui::Checkbox("  Show process name", &g_Config.showProcessName);
+            if (ImGui::IsItemHovered())
+                TooltipWrapped("Tracked game / process label on the overlay (all layouts).");
 
             // ── GPU SELECTION ──
             if (g_gpuCount > 0) {
@@ -2001,7 +2034,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::Spacing(); ImGui::Spacing();
             ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "FREQUENCY");
             ImGui::Spacing();
-            if (!g_lhwmAvailable) {
+            if (!g_lhwmInitFinished.load(std::memory_order_acquire)) {
+                ImGui::TextColored(ImVec4(.55f,.55f,.58f,1), "Initializing LibreHardwareMonitor…");
+            } else if (!g_lhwmAvailable) {
                 ImGui::TextColored(ImVec4(.55f,.55f,.58f,1), "Requires LibreHardwareMonitor.");
             } else {
                 ImGui::Checkbox("  Show CPU frequency", &g_Config.showCpuFreq);
@@ -2167,8 +2202,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(.16f,.68f,.44f,1));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(.10f,.48f,.32f,1));
             ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8);
-            if (ImGui::Button("Start Overlay", ImVec2(ImGui::GetContentRegionAvail().x, 42)))
+            const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
+            const char* startBtnLabel = lhwmBusy ? "Initializing LibreHardwareMonitor…" : "Start Overlay";
+            ImGui::BeginDisabled(lhwmBusy);
+            if (ImGui::Button(startBtnLabel, ImVec2(ImGui::GetContentRegionAvail().x, 42)))
                 g_Pending = CMD_START_OVERLAY;
+            ImGui::EndDisabled();
             ImGui::PopStyleVar();
             ImGui::PopStyleColor(3);
 
@@ -2491,7 +2530,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 const ImVec4 labGpu(0.52f, 0.90f, 0.70f, 1.f);  // mint green
                 const ImVec4 sepC(0.55f, 0.55f, 0.58f, 1.f);
 
-                const bool showProcLine = g_Config.showFPS && g_targetProcessName[0];
+                const bool showProcLine = g_Config.showFPS && g_Config.showProcessName && g_targetProcessName[0];
                 const float lineH = ImGui::GetTextLineHeightWithSpacing();
 
                 ImGui::SetWindowFontScale(1.0f * ss);
@@ -2713,7 +2752,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 }
                 
                 // Process name on second line (compact)
-                if (g_Config.showFPS && g_targetProcessName[0]) {
+                if (g_Config.showFPS && g_Config.showProcessName && g_targetProcessName[0]) {
                     ImGui::SetWindowFontScale(0.78f);
                     ImGui::TextColored(ImVec4(.42f,.52f,.42f,1), "%s", g_targetProcessName);
                     ImGui::SetWindowFontScale(1.0f);
@@ -2736,14 +2775,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "FPS  ---");
                     }
                     // Show tracked process name
-                    if (g_targetProcessName[0]) {
-                        ImGui::SetWindowFontScale(0.82f);
-                        ImGui::TextColored(ImVec4(.42f,.55f,.42f,1), "  %s", g_targetProcessName);
-                        ImGui::SetWindowFontScale(1.0f);
-                    } else {
-                        ImGui::SetWindowFontScale(0.82f);
-                        ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "  (no process)");
-                        ImGui::SetWindowFontScale(1.0f);
+                    if (g_Config.showProcessName) {
+                        if (g_targetProcessName[0]) {
+                            ImGui::SetWindowFontScale(0.82f);
+                            ImGui::TextColored(ImVec4(.42f,.55f,.42f,1), "  %s", g_targetProcessName);
+                            ImGui::SetWindowFontScale(1.0f);
+                        } else {
+                            ImGui::SetWindowFontScale(0.82f);
+                            ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "  (no process)");
+                            ImGui::SetWindowFontScale(1.0f);
+                        }
                     }
                     needSep = true;
                 }
@@ -2878,6 +2919,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (g_Mode == MODE_CONFIG) g_Running = false;
         return 0;
     case WM_DESTROY:
+        return 0;
+    case WM_GETMINMAXINFO:
+        if (g_Mode == MODE_CONFIG && lParam) {
+            MINMAXINFO* mmi = (MINMAXINFO*)lParam;
+            mmi->ptMinTrackSize.x = kConfigDlgOuterW;
+            mmi->ptMaxTrackSize.x = kConfigDlgOuterW;
+            mmi->ptMinTrackSize.y = kConfigDlgMinOuterH;
+        }
         return 0;
     case WM_SIZE:
         if (g_pd3dDevice && wParam != SIZE_MINIMIZED) {
