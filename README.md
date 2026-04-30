@@ -134,7 +134,7 @@ cd fps-overlay
 build-msvc.bat
 ```
 
-The output is `build\overlay.exe` along with required DLLs.
+The output is `build\output\overlay.exe` along with required DLLs.
 
 ### Dependencies (included)
 
@@ -154,10 +154,11 @@ fps-overlay/
 │   ├── imgui/          # Dear ImGui library
 │   └── lhwm/           # LibreHardwareMonitor wrapper
 ├── build/              # Build output
-│   ├── overlay.exe
-│   ├── lhwm-wrapper.dll
-│   ├── LibreHardwareMonitorLib.dll
-│   └── config.ini      # Settings (created on first run)
+│   ├── output/         # Release binaries (from build-msvc.bat)
+│   │   ├── overlay.exe
+│   │   ├── lhwm-wrapper.dll
+│   │   └── LibreHardwareMonitorLib.dll
+│   └── config.ini      # Settings (created on first run, next to overlay.exe)
 ├── icon.ico            # Application icon
 ├── build-msvc.bat      # Build script
 ├── FPSOverlay.vcxproj  # Visual Studio project
