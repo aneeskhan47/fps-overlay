@@ -42,13 +42,13 @@
   </ImportGroup>
   
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <OutDir>$(ProjectDir)build\output\</OutDir>
+    <OutDir>$(ProjectDir)build\overlay\</OutDir>
     <IntDir>$(ProjectDir)build\obj\Debug\</IntDir>
     <TargetName>overlay</TargetName>
   </PropertyGroup>
   
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <OutDir>$(ProjectDir)build\output\</OutDir>
+    <OutDir>$(ProjectDir)build\overlay\</OutDir>
     <IntDir>$(ProjectDir)build\obj\Release\</IntDir>
     <TargetName>overlay</TargetName>
   </PropertyGroup>

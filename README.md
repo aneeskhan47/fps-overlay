@@ -21,10 +21,10 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 - **Multi-GPU** — Detect all discrete GPUs and choose which one to monitor
 - **VRAM** — Memory usage (percent and used / total GB)
 - **RAM** — System memory usage (percent and used / total GB)
-- **Three layouts** — **Vertical** stack, **horizontal** compact one-liner, or a **Steam-style** bottom bar (with separate scale for the bar)
+- **Three layouts** — **Vertical** stack, **horizontal** compact one-liner, or a **Steam-style** bar
 - **Temperature units** — Celsius or Fahrenheit
 - **Process label** — Shows which process is used for the FPS / game name line
-- **Position & opacity** — Corners or drag-to-place; opacity for the overlay window
+- **Position & opacity** — Corners or drag-to-place; opacity for the overlay
 - **Persistent settings** — Saved next to the executable (`config.ini`)
 - **Fully click-through** — Does not steal mouse focus from games
 - **Custom hotkeys** — Toggle visibility and exit (default: **Insert** and **End**)
@@ -134,7 +134,7 @@ cd fps-overlay
 build-msvc.bat
 ```
 
-The output is `build\output\overlay.exe` along with required DLLs.
+The output is `build\overlay\overlay.exe` along with required DLLs.
 
 ### Dependencies (included)
 
@@ -154,7 +154,7 @@ fps-overlay/
 │   ├── imgui/          # Dear ImGui library
 │   └── lhwm/           # LibreHardwareMonitor wrapper
 ├── build/              # Build output
-│   ├── output/         # Release binaries (from build-msvc.bat)
+│   ├── overlay/        # Release binaries (from build-msvc.bat)
 │   │   ├── overlay.exe
 │   │   ├── lhwm-wrapper.dll
 │   │   └── LibreHardwareMonitorLib.dll
