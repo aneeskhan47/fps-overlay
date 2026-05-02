@@ -58,7 +58,7 @@
 #define IDM_RESET_POS 1006
 
 // Current version
-#define APP_VERSION "v1.5.1-beta"
+#define APP_VERSION "v1.5.2-beta"
 
 // Settings window: fixed outer width (px), vertical resize minimum outer height
 static const int kConfigDlgOuterW = 420;
@@ -126,13 +126,13 @@ struct OverlayConfig {
     bool useFahrenheit = false; // false = Celsius, true = Fahrenheit
     bool autoStart = false;   // skip config window and start overlay immediately
     int  position = 0;        // 0=TL  1=TR  2=BL  3=BR
-    int  opacity  = 85;       // 30..100 %
+    int  opacity  = 85;       // 30..100 % overlay background (all layouts)
     int  toggleKey = VK_INSERT;
     int  exitKey   = VK_END;
     float customX = -1.0f;    // custom position (-1 = use corner preset)
     float customY = -1.0f;
     int  selectedGpu = 0;     // selected GPU index (0 = first GPU)
-    int  steamBarScale = 100; // Steam-like layout size only: 50..200 (%), 100 = match vertical/horizontal text scale
+    int  overlayScale = 100;  // 50..200 % UI scale for all layouts
     bool showCpuFreq = false;
     bool showGpuCoreFreq = false;
     char cpuFreqPath[FREQ_PATH_MAX] = "";
@@ -263,7 +263,12 @@ static void LoadConfig(OverlayConfig& cfg)
     cfg.opacity       = ReadIniInt("Layout", "opacity", 85);
     cfg.customX       = ReadIniFloat("Layout", "customX", -1.0f);
     cfg.customY       = ReadIniFloat("Layout", "customY", -1.0f);
-    cfg.steamBarScale = ReadIniInt("Layout", "steamBarScale", 100);
+    {
+        int sc = ReadIniInt("Layout", "overlayScale", -1);
+        if (sc < 0)
+            sc = ReadIniInt("Layout", "steamBarScale", 100);
+        cfg.overlayScale = sc;
+    }
     
     // Hotkeys
     cfg.toggleKey     = ReadIniInt("Hotkeys", "toggleKey", VK_INSERT);
@@ -279,8 +284,8 @@ static void LoadConfig(OverlayConfig& cfg)
     if (cfg.selectedGpu < 0) cfg.selectedGpu = 0;
     if (cfg.layoutStyle < LAYOUT_VERTICAL || cfg.layoutStyle > LAYOUT_STEAM)
         cfg.layoutStyle = LAYOUT_VERTICAL;
-    if (cfg.steamBarScale < 50) cfg.steamBarScale = 50;
-    if (cfg.steamBarScale > 200) cfg.steamBarScale = 200;
+    if (cfg.overlayScale < 50) cfg.overlayScale = 50;
+    if (cfg.overlayScale > 200) cfg.overlayScale = 200;
 }
 
 // Check if welcome message has been shown (separate from config)
@@ -347,7 +352,7 @@ static void SaveConfig(const OverlayConfig& cfg)
     WriteIniInt("Layout", "opacity", cfg.opacity);
     WriteIniFloat("Layout", "customX", cfg.customX);
     WriteIniFloat("Layout", "customY", cfg.customY);
-    WriteIniInt("Layout", "steamBarScale", cfg.steamBarScale);
+    WriteIniInt("Layout", "overlayScale", cfg.overlayScale);
     
     // Hotkeys
     WriteIniInt("Hotkeys", "toggleKey", cfg.toggleKey);
@@ -2132,26 +2137,22 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     "Black bar with Steam-style FPS / CPU / GPU labels.\n"
                     "Same stats as horizontal compact (temps, VRAM/RAM detail, process name).\n"
                     "At 100% size, text matches vertical/horizontal scale.");
-            if (g_Config.layoutStyle == LAYOUT_STEAM) {
-                ImGui::Spacing();
-                ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "Steam bar size");
-                ImGui::Spacing();
-                ImGui::SetNextItemWidth(-1);
-                ImGui::SliderInt("##steamscale", &g_Config.steamBarScale, 50, 200, "%d%%");
-                if (ImGui::IsItemHovered())
-                    TooltipWrapped(
-                        "100% matches the default font size used in vertical and horizontal layouts.\n"
-                        "Hold CTRL over the bar (including padding) and drag to move.");
-            } else {
-                ImGui::Spacing();
-                ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "Overlay opacity");
-                ImGui::Spacing();
-                ImGui::SetNextItemWidth(-1);
-                ImGui::SliderInt("##opac", &g_Config.opacity, 30, 100, "%d%%");
-                if (ImGui::IsItemHovered())
-                    TooltipWrapped(
-                        "Steam-like layout uses a solid bar; opacity applies when you switch back to vertical or horizontal.");
-            }
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "Overlay size");
+            ImGui::Spacing();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderInt("##ovscale", &g_Config.overlayScale, 50, 200, "%d%%");
+            if (ImGui::IsItemHovered())
+                TooltipWrapped(
+                    "Text and spacing scale for vertical, horizontal, and Steam-like layouts.\n"
+                    "Hold CTRL on the overlay and drag to move.");
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "Overlay opacity");
+            ImGui::Spacing();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderInt("##opac", &g_Config.opacity, 30, 100, "%d%%");
+            if (ImGui::IsItemHovered())
+                TooltipWrapped("Background transparency for all layouts (default 85%).");
             
             // ── TEMPERATURE UNIT ──
             ImGui::Spacing(); ImGui::Spacing();
@@ -2458,8 +2459,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 }
             }
             
-            // Full opacity when CTRL held, otherwise user setting
-            ImGui::SetNextWindowBgAlpha(ctrlHeld ? 1.0f : (g_Config.opacity / 100.f));
+            const float opacityPct = (float)g_Config.opacity;
+            const float overlayBgAlpha = ctrlHeld ? 1.0f : (opacityPct / 100.f);
+            ImGui::SetNextWindowBgAlpha(overlayBgAlpha);
+
+            const float ovSc = g_Config.overlayScale / 100.f;
 
             // Window flags - allow dragging when CTRL is held
             ImGuiWindowFlags wf =
@@ -2473,9 +2477,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             }
 
             if (g_Config.layoutStyle == LAYOUT_STEAM) {
-                const float steamSs = g_Config.steamBarScale / 100.f;
-                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f * steamSs, 6.f * steamSs));
-                ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.f * steamSs, 2.f * steamSs));
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f * ovSc, 6.f * ovSc));
+                ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.f * ovSc, 2.f * ovSc));
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
                 ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.f, 0.f, 0.f, 1.f));
@@ -2533,7 +2536,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             // STEAM-LIKE BAR (same stats as horizontal: FPS, CPU+temp, GPU+temp, VRAM/RAM, process line)
             // ═══════════════════════════════════════════════════════════
             if (g_Config.layoutStyle == LAYOUT_STEAM) {
-                const float ss = g_Config.steamBarScale / 100.f;
+                const float ss = ovSc;
                 const float hs = 4.f * ss;
                 const float hsTight = 3.f * ss;
 
@@ -2676,6 +2679,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             // HORIZONTAL COMPACT VIEW
             // ═══════════════════════════════════════════════════════════
             else if (g_Config.layoutStyle == LAYOUT_HORIZONTAL) {
+                ImGui::SetWindowFontScale(ovSc);
                 bool needSep = false;
                 
                 // FPS
@@ -2708,7 +2712,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         ImGui::TextColored(ImVec4(.35f,.35f,.40f,1), " | ");
                         ImGui::SameLine();
                         InlineFreqSparkMHz("##hz_cpu", g_cpuSpark, g_cpuSparkN, g_cpuClockMHz,
-                                           ImVec2(52.f, 12.f), 6.f, ImVec4(.62f, .62f, .68f, 1.f));
+                                           ImVec2(52.f * ovSc, 12.f * ovSc), 6.f * ovSc, ImVec4(.62f, .62f, .68f, 1.f));
                     }
                     needSep = true;
                 }
@@ -2736,7 +2740,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                             ImGui::TextColored(ImVec4(.35f,.35f,.40f,1), " | ");
                             ImGui::SameLine();
                             InlineFreqSparkMHz("##hz_gpu", g_gpuSpark, g_gpuSparkN, g_gpuCoreClockMHz,
-                                               ImVec2(52.f, 12.f), 6.f, ImVec4(.62f, .62f, .68f, 1.f));
+                                               ImVec2(52.f * ovSc, 12.f * ovSc), 6.f * ovSc, ImVec4(.62f, .62f, .68f, 1.f));
                         }
                     } else {
                         ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "GPU N/A");
@@ -2765,15 +2769,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 
                 // Process name on second line (compact)
                 if (g_Config.showFPS && g_Config.showProcessName && g_targetProcessName[0]) {
-                    ImGui::SetWindowFontScale(0.78f);
+                    ImGui::SetWindowFontScale(0.78f * ovSc);
                     ImGui::TextColored(ImVec4(.42f,.52f,.42f,1), "%s", g_targetProcessName);
-                    ImGui::SetWindowFontScale(1.0f);
+                    ImGui::SetWindowFontScale(ovSc);
                 }
+                ImGui::SetWindowFontScale(1.0f);
             }
             // ═══════════════════════════════════════════════════════════
             // VERTICAL VIEW (default)
             // ═══════════════════════════════════════════════════════════
             else {
+                ImGui::SetWindowFontScale(ovSc);
                 bool needSep = false;
 
                 // FPS
@@ -2789,13 +2795,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     // Show tracked process name
                     if (g_Config.showProcessName) {
                         if (g_targetProcessName[0]) {
-                            ImGui::SetWindowFontScale(0.82f);
+                            ImGui::SetWindowFontScale(0.82f * ovSc);
                             ImGui::TextColored(ImVec4(.42f,.55f,.42f,1), "  %s", g_targetProcessName);
-                            ImGui::SetWindowFontScale(1.0f);
+                            ImGui::SetWindowFontScale(ovSc);
                         } else {
-                            ImGui::SetWindowFontScale(0.82f);
+                            ImGui::SetWindowFontScale(0.82f * ovSc);
                             ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "  (no process)");
-                            ImGui::SetWindowFontScale(1.0f);
+                            ImGui::SetWindowFontScale(ovSc);
                         }
                     }
                     needSep = true;
@@ -2814,14 +2820,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                                                    : ImVec4(.70f,.70f,.75f,1);
                         ImGui::TextColored(tc, " %.0f\xC2\xB0%s", dispTemp, g_Config.useFahrenheit ? "F" : "C");
                     }
-                    ImGui::SetWindowFontScale(0.82f);
+                    ImGui::SetWindowFontScale(0.82f * ovSc);
                     ImGui::TextColored(ImVec4(.42f,.42f,.48f,1), "  %s", g_cpuName);
-                    ImGui::SetWindowFontScale(1.0f);
+                    ImGui::SetWindowFontScale(ovSc);
                     if (g_Config.showCpuFreq && g_Config.cpuFreqPath[0] && g_lhwmAvailable) {
-                        ImGui::Dummy(ImVec2(0, 3));
+                        ImGui::Dummy(ImVec2(0, 3.f * ovSc));
                         ImGui::TextColored(ImVec4(.48f,.58f,.65f,1), "CPU MHz");
                         ImGui::SameLine();
-                        DrawMiniSpark("##vsp_cpu", g_cpuSpark, g_cpuSparkN, g_cpuClockMHz, ImVec2(130.f, 24.f));
+                        DrawMiniSpark("##vsp_cpu", g_cpuSpark, g_cpuSparkN, g_cpuClockMHz, ImVec2(130.f * ovSc, 24.f * ovSc));
                     }
                     needSep = true;
                 }
@@ -2856,14 +2862,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     } else {
                         ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "GPU  N/A");
                     }
-                    ImGui::SetWindowFontScale(0.82f);
+                    ImGui::SetWindowFontScale(0.82f * ovSc);
                     ImGui::TextColored(ImVec4(.42f,.42f,.48f,1), "  %s", g_gpuName);
-                    ImGui::SetWindowFontScale(1.0f);
+                    ImGui::SetWindowFontScale(ovSc);
                     if (g_Config.showGpuCoreFreq && g_Config.gpuCoreFreqPath[0] && g_lhwmAvailable && hasGpuData) {
-                        ImGui::Dummy(ImVec2(0, 3));
+                        ImGui::Dummy(ImVec2(0, 3.f * ovSc));
                         ImGui::TextColored(ImVec4(.48f,.58f,.65f,1), "GPU MHz");
                         ImGui::SameLine();
-                        DrawMiniSpark("##vsp_gpu", g_gpuSpark, g_gpuSparkN, g_gpuCoreClockMHz, ImVec2(130.f, 24.f));
+                        DrawMiniSpark("##vsp_gpu", g_gpuSpark, g_gpuSparkN, g_gpuCoreClockMHz, ImVec2(130.f * ovSc, 24.f * ovSc));
                     }
                     needSep = true;
                 }
@@ -2876,6 +2882,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     ImGui::SameLine();
                     ImGui::TextColored(ImVec4(.70f,.70f,.75f,1), " %.1f / %.1f GB", ramUsed, ramTotal);
                 }
+                ImGui::SetWindowFontScale(1.0f);
             }
             
             // ── Show helper text when CTRL is held ──
@@ -2883,9 +2890,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::Spacing();
-                float helpSc = (g_Config.layoutStyle == LAYOUT_STEAM)
-                    ? (0.85f * (g_Config.steamBarScale / 100.f))
-                    : 0.85f;
+                float helpSc = 0.85f * ovSc;
                 ImGui::SetWindowFontScale(helpSc);
                 ImGui::TextColored(ImVec4(0.5f, 0.75f, 1.0f, 1.0f), "Drag to move | Right-click for menu");
                 ImGui::SetWindowFontScale(1.0f);

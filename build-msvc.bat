@@ -29,7 +29,7 @@ echo.
 echo Building FPS Overlay (Release x64)...
 echo.
 
-if not exist "build\output" mkdir "build\output"
+if not exist "build\overlay" mkdir "build\overlay"
 
 REM Build using MSBuild
 msbuild FPSOverlay.vcxproj /p:Configuration=Release /p:Platform=x64 /m /verbosity:minimal
@@ -44,14 +44,14 @@ echo.
 echo Build successful!
 echo.
 
-REM Copy required DLLs to build\output
+REM Copy required DLLs to build\overlay
 echo Copying required DLLs...
 if exist "libs\lhwm\lhwm-wrapper.dll" (
-    copy /Y "libs\lhwm\lhwm-wrapper.dll" "build\output\" >nul
+    copy /Y "libs\lhwm\lhwm-wrapper.dll" "build\overlay\" >nul
     echo   - lhwm-wrapper.dll copied
 )
 if exist "libs\lhwm\LibreHardwareMonitorLib.dll" (
-    copy /Y "libs\lhwm\LibreHardwareMonitorLib.dll" "build\output\" >nul
+    copy /Y "libs\lhwm\LibreHardwareMonitorLib.dll" "build\overlay\" >nul
     echo   - LibreHardwareMonitorLib.dll copied
 )
 
@@ -65,10 +65,10 @@ if exist "build\obj" (
 echo.
 echo ========================================
 echo   Build complete!
-echo   Output: build\output\overlay.exe
+echo   Output: build\overlay\overlay.exe
 echo ========================================
 echo.
-echo Required files in build\output:
+echo Required files in build\overlay:
 echo   - overlay.exe
 echo   - lhwm-wrapper.dll (for LHWM support)
 echo   - LibreHardwareMonitorLib.dll (for LHWM support)
