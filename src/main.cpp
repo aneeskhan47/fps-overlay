@@ -58,7 +58,7 @@
 #define IDM_RESET_POS 1006
 
 // Current version
-#define APP_VERSION "v1.5.2-beta"
+#define APP_VERSION "v1.5.3-beta"
 
 // Settings window: fixed outer width (px), vertical resize minimum outer height
 static const int kConfigDlgOuterW = 420;
@@ -150,6 +150,7 @@ struct GpuInfo {
     std::string loadPath;      // LHWM sensor path for GPU load
     std::string vramUsedPath;  // LHWM sensor path for VRAM used
     std::string vramTotalPath; // LHWM sensor path for VRAM total
+    int         vramTotalPri = -1; // higher = better match (see VramTotalSensorPriority)
     std::vector<std::pair<std::string, std::string>> coreClockOpts; // display name, path
 };
 static GpuInfo g_gpuList[MAX_GPUS];
@@ -1100,6 +1101,26 @@ static bool IsGpuMemoryClockSensor(const std::string& name)
     return false;
 }
 
+// LHWM exposes several "*Memory Total*" sensors on APUs (e.g. ROG Ally). "Shared Memory Total"
+// contains the substring "Memory Total" and can overwrite "GPU Memory Total" (last match wins).
+// Prefer the same row users see in LHM: GPU Memory Total, then dedicated/D3D, not shared pool.
+static int VramTotalSensorPriority(const std::string& sensorName)
+{
+    std::string n;
+    n.reserve(sensorName.size());
+    for (char c : sensorName)
+        n += (char)tolower((unsigned char)c);
+    if (n.find("shared") != std::string::npos)
+        return -1;
+    if (n.find("gpu memory total") != std::string::npos)
+        return 100;
+    if (n.find("dedicated memory total") != std::string::npos || n.find("d3d dedicated") != std::string::npos)
+        return 80;
+    if (n.find("memory total") != std::string::npos)
+        return 50;
+    return -1;
+}
+
 static bool InitLHWM()
 {
     try {
@@ -1148,6 +1169,7 @@ static bool InitLHWM()
                     g_gpuList[gpuIndex].loadPath.clear();
                     g_gpuList[gpuIndex].vramUsedPath.clear();
                     g_gpuList[gpuIndex].vramTotalPath.clear();
+                    g_gpuList[gpuIndex].vramTotalPri = -1;
                     g_gpuCount++;
                 }
             }
@@ -1206,9 +1228,12 @@ static bool InitLHWM()
                             sensorName.find("GPU Memory Used") != std::string::npos) {
                             g_gpuList[gpuIndex].vramUsedPath = sensorPath;
                         }
-                        else if (sensorName.find("Memory Total") != std::string::npos ||
-                                 sensorName.find("GPU Memory Total") != std::string::npos) {
-                            g_gpuList[gpuIndex].vramTotalPath = sensorPath;
+                        else {
+                            int totPri = VramTotalSensorPriority(sensorName);
+                            if (totPri >= 0 && totPri > g_gpuList[gpuIndex].vramTotalPri) {
+                                g_gpuList[gpuIndex].vramTotalPath = sensorPath;
+                                g_gpuList[gpuIndex].vramTotalPri = totPri;
+                            }
                         }
                     }
                     else if (sensorType == "Clock") {
