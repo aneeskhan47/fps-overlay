@@ -58,7 +58,7 @@
 #define IDM_RESET_POS 1006
 
 // Current version
-#define APP_VERSION "v1.5.2-beta"
+#define APP_VERSION "v1.5.3-beta"
 
 // Settings window: fixed outer width (px), vertical resize minimum outer height
 static const int kConfigDlgOuterW = 420;
