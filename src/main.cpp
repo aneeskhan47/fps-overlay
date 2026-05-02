@@ -1040,24 +1040,36 @@ static bool PromptAndInstallPawnIO()
 // ═══════════════════════════════════════════════════════════════════════════
 // LibreHardwareMonitor (LHWM) — cross-vendor hardware monitoring
 // ═══════════════════════════════════════════════════════════════════════════
-// Helper to check if a hardware name is a GPU (excluding integrated graphics)
-static bool IsDiscreteGpu(const std::string& name) {
-    // Check for discrete GPU identifiers
-    bool isGpu = (name.find("GeForce") != std::string::npos ||
-                  name.find("RTX") != std::string::npos ||
-                  name.find("GTX") != std::string::npos ||
-                  name.find("Radeon RX") != std::string::npos ||
-                  name.find("Radeon Pro") != std::string::npos ||
-                  name.find("Arc") != std::string::npos ||  // Intel Arc
-                  name.find("NVIDIA") != std::string::npos);
-    
-    // Exclude integrated graphics
-    bool isIntegrated = (name.find("Radeon Graphics") != std::string::npos ||  // AMD APU
-                         name.find("Intel UHD") != std::string::npos ||
-                         name.find("Intel HD") != std::string::npos ||
-                         name.find("Intel Iris") != std::string::npos);
-    
-    return isGpu && !isIntegrated;
+// True for LHWM "GPU" hardware nodes we should bind sensors to (discrete + integrated).
+// Names like "AMD Radeon(TM) Graphics" (ROG Ally / APUs) never matched only "Radeon RX" / GeForce,
+// so g_gpuCount stayed 0 and GPU stats were N/A.
+static bool IsLhwmGpuHardwareNode(const std::string& name)
+{
+    if (name.find("GeForce") != std::string::npos) return true;
+    if (name.find("RTX") != std::string::npos) return true;
+    if (name.find("GTX") != std::string::npos) return true;
+    if (name.find("Radeon RX") != std::string::npos) return true;
+    if (name.find("Radeon Pro") != std::string::npos) return true;
+    if (name.find("NVIDIA") != std::string::npos) return true;
+    if (name.find("Intel") != std::string::npos && name.find("Arc") != std::string::npos) return true;
+
+    // AMD integrated: "Radeon" present but not discrete RX / Pro product lines
+    if (name.find("Radeon") != std::string::npos &&
+        name.find("Radeon RX") == std::string::npos && name.find("Radeon Pro") == std::string::npos) {
+        if (name.find("Graphics") != std::string::npos) return true;
+        if (name.find("780M") != std::string::npos || name.find("760M") != std::string::npos ||
+            name.find("740M") != std::string::npos ||
+            name.find("680M") != std::string::npos || name.find("660M") != std::string::npos)
+            return true;
+    }
+
+    if (name.find("Intel") != std::string::npos && name.find("Graphics") != std::string::npos) {
+        if (name.find("UHD") != std::string::npos || name.find("HD Graphics") != std::string::npos ||
+            name.find("Iris") != std::string::npos)
+            return true;
+    }
+
+    return false;
 }
 
 // Find an existing GPU in the list by name, or return -1
@@ -1110,11 +1122,11 @@ static bool InitLHWM()
                                   hardwareName.find("CPU") != std::string::npos ||
                                   hardwareName.find("Core") != std::string::npos);
             
-            bool isDiscreteGpuHardware = IsDiscreteGpu(hardwareName);
+            bool isGpuHardware = IsLhwmGpuHardwareNode(hardwareName);
             
-            // If this is a discrete GPU, find or create entry in GPU list
+            // If this is a GPU hardware node (discrete or integrated), find or create list entry
             int gpuIndex = -1;
-            if (isDiscreteGpuHardware && g_gpuCount < MAX_GPUS) {
+            if (isGpuHardware && g_gpuCount < MAX_GPUS) {
                 // Clean the hardware name - LHWM may return "Name : /path", we only want the name
                 std::string cleanName = hardwareName;
                 size_t colonPos = cleanName.find(" : ");
