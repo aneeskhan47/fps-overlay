@@ -4,7 +4,23 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 
 ![Size](https://img.shields.io/badge/size-~9MB-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![License](https://img.shields.io/badge/license-GNU%20GPLv3-green) ![Status](https://img.shields.io/badge/status-beta-orange)
 
+> [!WARNING]
 > **⚠️ Beta Software:** This project is currently in beta and under active development. Features, UI, and behavior are subject to change. Feedback and bug reports are welcome!
+
+> [!Important]
+> <details>
+> <summary>Read Important Information Regarding Antivirus's False Positives</summary> 
+>
+> #### This happens relatively frequently with specialized system tools for some key reasons:
+>
+> - **LibHardwareMonitor**: The FPS Overlay makes use of the [LibHardwareMonitor](https://github.com/LibreHardwaRemonitor/LibreHardwareMonitor) library to pull hardware information like your CPU temperature and GPU usage on the fly. Since this library deals directly with hardware drivers and low level system APIs heuristic based scanners such as VirusTotal often flag this as "suspicious" or "malicious behavior" since it mimics the way certain malicious software interacts with the internal system.
+> - **Overlay Injection**: Since the application needs to draw an overlay ontop of your currently open windows, such as your games, certain AV scanners misinterpret this as "code injection" which is what is often flagged by AI driven security vendors.
+> - **Unsigned Binaries:** The source for the application is open-source and as the executable itself is currently unsigned with a very expensive commercial certificate, a number of smaller, more sensitive AV engines are quick to "flag it as high confidence" risk since the publisher is "unknown".
+>
+> The easiest way for you to verify this is to examine the source code for yourself:
+>
+> All the code is open source here on github repo, here you can verify how the data is handled, and here you can see how its interface with the LibHardwareMonitor library. In the worst case scenario and even if you are worried, you can even build the application yourself directly on your machine.
+> </details>
 
 > [!CAUTION]
 > #### Fullscreen display modes are not supported\*
