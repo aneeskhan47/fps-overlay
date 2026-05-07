@@ -192,20 +192,10 @@ fps-overlay/
 - **CPU Temp:** LibreHardwareMonitor / WMI fallback
 - **Windowing:** Win32 API (layered transparent window)
 
-## Support the development
-**Do you like this tool? Support it by donating**
+## Like this project?
 
-- Github Sponsor: [Sponsor](https://github.com/sponsors/aneeskhan47)
-- PayPal: [Donate](https://www.paypal.com/paypalme/aneeskhan47)
+ Please consider leaving a tip on Ko-Fi :)
 
-## License
-
-GNU General Public License v3.0 - see [LICENSE.txt](LICENSE.txt) for details.
-
-## Contributing
-
-Found a bug? Have a feature request? PRs welcome.
-
----
-
+ <p align="center"><a href='https://ko-fi.com/aneeskhan47' target='_blank'><img height='42' style='border:0px;height:42px;' src='https://cdn.ko-fi.com/cdn/kofi3.png?v=3' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a></p>
+  
 *No bloat. No telemetry. Just stats.*
