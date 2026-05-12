@@ -1121,6 +1121,42 @@ static int VramTotalSensorPriority(const std::string& sensorName)
     return -1;
 }
 
+// LHM AMD "Soc" (SoC) — must not match "Socket" (substring "Soc" inside "Socket").
+static bool IsAmdSocCpuTempSensorName(const std::string& sensorName)
+{
+    std::string n;
+    n.reserve(sensorName.size());
+    for (char c : sensorName)
+        n += (char)tolower((unsigned char)c);
+    if (n.find("socket") != std::string::npos)
+        return false;
+    if (n == "soc")
+        return true;
+    if (n.find("soc") != std::string::npos)
+        return true;
+    return false;
+}
+
+// When SoC / Package is absent, prefer the same die reading users watch in LHM (Core Tctl/Tdie).
+static int CpuTempFallbackPriority(const std::string& sensorName)
+{
+    std::string n;
+    n.reserve(sensorName.size());
+    for (char c : sensorName)
+        n += (char)tolower((unsigned char)c);
+    const bool hasCore = (n.find("core") != std::string::npos);
+    const bool hasTctl = (n.find("tctl") != std::string::npos);
+    const bool hasTdie = (n.find("tdie") != std::string::npos);
+    const bool hasCcd  = (n.find("ccd") != std::string::npos);
+    if (hasCore && (hasTctl || hasTdie))
+        return 100;
+    if (hasCcd)
+        return 60;
+    if (hasTctl || hasTdie)
+        return 80;
+    return 10;
+}
+
 static bool InitLHWM()
 {
     try {
@@ -1138,7 +1174,8 @@ static bool InitLHWM()
         //   tuple[1] = Sensor type (e.g., "Temperature", "Load")
         //   tuple[2] = Sensor path (e.g., "/amdcpu/0/temperature/0")
         
-        std::string cpuTempFallback;
+        std::string cpuTempFallbackPath;
+        int         cpuTempFallbackPri = -1;
         g_gpuCount = 0;  // Reset GPU count
         
         for (const auto& [hardwareName, sensorList] : sensors) {
@@ -1188,16 +1225,20 @@ static bool InitLHWM()
                 // CPU temperature sensors
                 if ((isCpuHardware || isCpuPath) && sensorType == "Temperature") {
                     // Priority order for CPU temp (matching Task Manager):
-                    // 1. "Soc" - AMD SoC temperature (most accurate for overall CPU temp)
+                    // 1. AMD SoC ("Soc") — not "Socket" (false positive on substring "Soc")
                     // 2. "Package" - Intel package temp
-                    // 3. Fallback to any other CPU temp
-                    if (sensorName == "Soc" || sensorName.find("Soc") != std::string::npos) {
-                        g_lhwmCpuTempPath = sensorPath;  // Best choice for AMD
-                    } else if (g_lhwmCpuTempPath.empty() && 
+                    // 3. Fallback: prefer Core (Tctl/Tdie), then other Tdie/Tctl, then CCD, else any
+                    if (IsAmdSocCpuTempSensorName(sensorName)) {
+                        g_lhwmCpuTempPath = sensorPath;  // Best choice for AMD (when present)
+                    } else if (g_lhwmCpuTempPath.empty() &&
                                sensorName.find("Package") != std::string::npos) {
                         g_lhwmCpuTempPath = sensorPath;  // Best choice for Intel
                     } else if (g_lhwmCpuTempPath.empty()) {
-                        cpuTempFallback = sensorPath;
+                        int p = CpuTempFallbackPriority(sensorName);
+                        if (p > cpuTempFallbackPri) {
+                            cpuTempFallbackPath = sensorPath;
+                            cpuTempFallbackPri = p;
+                        }
                     }
                 }
                 
@@ -1261,8 +1302,8 @@ static bool InitLHWM()
         }
         
         // Use fallback CPU temp if needed
-        if (g_lhwmCpuTempPath.empty() && !cpuTempFallback.empty()) {
-            g_lhwmCpuTempPath = cpuTempFallback;
+        if (g_lhwmCpuTempPath.empty() && !cpuTempFallbackPath.empty()) {
+            g_lhwmCpuTempPath = cpuTempFallbackPath;
         }
         
         // Clamp selected GPU to valid range
