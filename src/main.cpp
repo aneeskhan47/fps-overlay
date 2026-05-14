@@ -27,9 +27,13 @@
 #include <cstdarg>
 #include <cstring>
 #include <cmath>
-#include <thread>
+#include <cstdlib>
+#include <cwchar>
+#include <cwctype>
+#include <ctime>
 #include <atomic>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include <algorithm>
 #include <utility>
@@ -58,7 +62,7 @@
 #define IDM_RESET_POS 1006
 
 // Current version
-#define APP_VERSION "v1.5.3-beta"
+#define APP_VERSION "v1.6.0-beta"
 
 // Settings window: fixed outer width (px), vertical resize minimum outer height
 static const int kConfigDlgOuterW = 420;
@@ -112,20 +116,30 @@ static const char* ETW_SESSION_NAME = "FPSOverlay_ETW";
 #define LAYOUT_HORIZONTAL 1
 #define LAYOUT_STEAM      2
 
+// Overlay corner / edge (work-area relative). Legacy INI 0..3 remapped on load via positionVer.
+#define POS_TOP_LEFT       0
+#define POS_TOP_CENTER     1
+#define POS_TOP_RIGHT      2
+#define POS_BOTTOM_LEFT    3
+#define POS_BOTTOM_CENTER  4
+#define POS_BOTTOM_RIGHT   5
+
 #define FREQ_PATH_MAX   260
 #define FREQ_SPARK_LEN  48
 
 struct OverlayConfig {
     bool showFPS  = true;
-    bool showCPU  = true;
-    bool showGPU  = true;
+    bool showCpuUsage = true;
+    bool showCpuTemp = true;
+    bool showGpuUsage = true;
+    bool showGpuTemp = true;
     bool showVRAM = true;     // GPU VRAM usage
     bool showRAM  = true;
     bool showProcessName = true; // tracked game / process label (all layouts)
     int  layoutStyle = LAYOUT_VERTICAL;
     bool useFahrenheit = false; // false = Celsius, true = Fahrenheit
     bool autoStart = false;   // skip config window and start overlay immediately
-    int  position = 0;        // 0=TL  1=TR  2=BL  3=BR
+    int  position = POS_TOP_LEFT; // POS_* constants
     int  opacity  = 85;       // 30..100 % overlay background (all layouts)
     int  toggleKey = VK_INSERT;
     int  exitKey   = VK_END;
@@ -169,6 +183,8 @@ inline float GetMedTempThreshold(bool useFahrenheit) { return useFahrenheit ? 15
 // Configuration file (INI) - saved next to overlay.exe
 // ═══════════════════════════════════════════════════════════════════════════
 static char g_configPath[MAX_PATH] = "";
+// Written when PawnIO_setup succeeds; survives config.ini being rewritten or stripped.
+static char g_pawnioRebootStatePath[MAX_PATH] = "";
 
 static void InitConfigPath()
 {
@@ -184,6 +200,7 @@ static void InitConfigPath()
     
     // Append the config filename
     snprintf(g_configPath, MAX_PATH, "%sconfig.ini", exePath);
+    snprintf(g_pawnioRebootStatePath, MAX_PATH, "%sfpsoverlay-pawnio-reboot.state", exePath);
 }
 
 static int ReadIniInt(const char* section, const char* key, int defaultVal)
@@ -225,6 +242,59 @@ static void WriteIniStr(const char* section, const char* key, const char* value)
     WritePrivateProfileStringA(section, key, value ? value : "", g_configPath);
 }
 
+// PawnIO reboot gate — sidecar state (see CommitPawnIORebootPending / CheckPawnIORebootGateOrExit).
+static bool WritePawnIORebootPendingStateFile(const char* hex16)
+{
+    if (!hex16 || strlen(hex16) != 16) return false;
+    InitConfigPath();
+    char line[96];
+    snprintf(line, sizeof(line), "FPSOVERLAY_PAWNIO_REBOOT 1 %s\n", hex16);
+    const DWORD flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH;
+    HANDLE h = CreateFileA(g_pawnioRebootStatePath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           flags, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+    DWORD written = 0;
+    const size_t n = strlen(line);
+    const BOOL ok = WriteFile(h, line, (DWORD)n, &written, nullptr) && written == (DWORD)n;
+    FlushFileBuffers(h);
+    CloseHandle(h);
+    return ok != FALSE;
+}
+
+static bool ReadPawnIORebootPendingStateFile(char* hexOut, size_t cap)
+{
+    if (!hexOut || cap < 17) return false;
+    hexOut[0] = '\0';
+    InitConfigPath();
+    HANDLE h = CreateFileA(g_pawnioRebootStatePath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+    char buf[256] = {};
+    DWORD rd = 0;
+    const BOOL ok = ReadFile(h, buf, sizeof(buf) - 1, &rd, nullptr);
+    CloseHandle(h);
+    if (!ok || rd == 0) return false;
+    buf[rd] = '\0';
+    int ver = 0;
+    char hexBuf[24] = {};
+    if (sscanf_s(buf, "FPSOVERLAY_PAWNIO_REBOOT %d %23s", &ver, hexBuf, (unsigned)sizeof(hexBuf)) < 2 || ver != 1)
+        return false;
+    if (strlen(hexBuf) != 16) return false;
+    unsigned long long v = 0;
+    if (sscanf_s(hexBuf, "%llx", &v) != 1) return false;
+    (void)v;
+    snprintf(hexOut, cap, "%s", hexBuf);
+    return true;
+}
+
+static void DeletePawnIORebootPendingStateFile()
+{
+    InitConfigPath();
+    DeleteFileA(g_pawnioRebootStatePath);
+}
+
 static void LoadConfig(OverlayConfig& cfg)
 {
     InitConfigPath();
@@ -238,8 +308,22 @@ static void LoadConfig(OverlayConfig& cfg)
     
     // Display settings
     cfg.showFPS       = ReadIniInt("Display", "showFPS", 1) != 0;
-    cfg.showCPU       = ReadIniInt("Display", "showCPU", 1) != 0;
-    cfg.showGPU       = ReadIniInt("Display", "showGPU", 1) != 0;
+    {
+        const int legacyCpu = ReadIniInt("Display", "showCPU", 1);
+        int cu = ReadIniInt("Display", "showCpuUsage", -1);
+        if (cu < 0) cu = legacyCpu;
+        cfg.showCpuUsage = cu != 0;
+        int ct = ReadIniInt("Display", "showCpuTemp", -1);
+        if (ct < 0) ct = legacyCpu;
+        cfg.showCpuTemp = ct != 0;
+        const int legacyGpu = ReadIniInt("Display", "showGPU", 1);
+        int gu = ReadIniInt("Display", "showGpuUsage", -1);
+        if (gu < 0) gu = legacyGpu;
+        cfg.showGpuUsage = gu != 0;
+        int gt = ReadIniInt("Display", "showGpuTemp", -1);
+        if (gt < 0) gt = legacyGpu;
+        cfg.showGpuTemp = gt != 0;
+    }
     cfg.showVRAM      = ReadIniInt("Display", "showVRAM", 1) != 0;
     cfg.showRAM       = ReadIniInt("Display", "showRAM", 1) != 0;
     cfg.showProcessName = ReadIniInt("Display", "showProcessName", 1) != 0;
@@ -260,7 +344,19 @@ static void LoadConfig(OverlayConfig& cfg)
     }
     cfg.useFahrenheit = ReadIniInt("Layout", "useFahrenheit", 0) != 0;
     cfg.autoStart     = ReadIniInt("Layout", "autoStart", 0) != 0;
-    cfg.position      = ReadIniInt("Layout", "position", 0);
+    {
+        const int posVer = ReadIniInt("Layout", "positionVer", 0);
+        int pos = ReadIniInt("Layout", "position", 0);
+        if (posVer < 2) {
+            // Legacy: TL=0, TR=1, BL=2, BR=3  ->  new POS_* grid
+            static const int kLegacyToPos[] = { POS_TOP_LEFT, POS_TOP_RIGHT, POS_BOTTOM_LEFT, POS_BOTTOM_RIGHT };
+            if (pos >= 0 && pos <= 3)
+                pos = kLegacyToPos[pos];
+            WriteIniInt("Layout", "positionVer", 2);
+            WriteIniInt("Layout", "position", pos);
+        }
+        cfg.position = pos;
+    }
     cfg.opacity       = ReadIniInt("Layout", "opacity", 85);
     cfg.customX       = ReadIniFloat("Layout", "customX", -1.0f);
     cfg.customY       = ReadIniFloat("Layout", "customY", -1.0f);
@@ -279,7 +375,7 @@ static void LoadConfig(OverlayConfig& cfg)
     cfg.selectedGpu   = ReadIniInt("GPU", "selectedGpu", 0);
     
     // Clamp values to valid ranges
-    if (cfg.position < 0 || cfg.position > 3) cfg.position = 0;
+    if (cfg.position < POS_TOP_LEFT || cfg.position > POS_BOTTOM_RIGHT) cfg.position = POS_TOP_LEFT;
     if (cfg.opacity < 30) cfg.opacity = 30;
     if (cfg.opacity > 100) cfg.opacity = 100;
     if (cfg.selectedGpu < 0) cfg.selectedGpu = 0;
@@ -330,11 +426,25 @@ static void ShowWelcomeMessage()
 static void SaveConfig(const OverlayConfig& cfg)
 {
     InitConfigPath();
-    
+
+    int pawnioRb = ReadIniInt("App", "PawnIORequiresReboot", 0);
+    char pawnioHex[48] = {};
+    ReadIniStr("App", "PawnIOInstallUtcHex", pawnioHex, sizeof(pawnioHex));
+    char sidecarHex[48] = {};
+    if (ReadPawnIORebootPendingStateFile(sidecarHex, sizeof(sidecarHex))) {
+        pawnioRb = 1;
+        snprintf(pawnioHex, sizeof(pawnioHex), "%s", sidecarHex);
+    }
+
     // Display settings
     WriteIniInt("Display", "showFPS", cfg.showFPS ? 1 : 0);
-    WriteIniInt("Display", "showCPU", cfg.showCPU ? 1 : 0);
-    WriteIniInt("Display", "showGPU", cfg.showGPU ? 1 : 0);
+    WriteIniInt("Display", "showCpuUsage", cfg.showCpuUsage ? 1 : 0);
+    WriteIniInt("Display", "showCpuTemp", cfg.showCpuTemp ? 1 : 0);
+    WriteIniInt("Display", "showGpuUsage", cfg.showGpuUsage ? 1 : 0);
+    WriteIniInt("Display", "showGpuTemp", cfg.showGpuTemp ? 1 : 0);
+    // Legacy combined flags (older builds / hand-edited inis)
+    WriteIniInt("Display", "showCPU", (cfg.showCpuUsage || cfg.showCpuTemp) ? 1 : 0);
+    WriteIniInt("Display", "showGPU", (cfg.showGpuUsage || cfg.showGpuTemp) ? 1 : 0);
     WriteIniInt("Display", "showVRAM", cfg.showVRAM ? 1 : 0);
     WriteIniInt("Display", "showRAM", cfg.showRAM ? 1 : 0);
     WriteIniInt("Display", "showProcessName", cfg.showProcessName ? 1 : 0);
@@ -350,6 +460,7 @@ static void SaveConfig(const OverlayConfig& cfg)
     WriteIniInt("Layout", "useFahrenheit", cfg.useFahrenheit ? 1 : 0);
     WriteIniInt("Layout", "autoStart", cfg.autoStart ? 1 : 0);
     WriteIniInt("Layout", "position", cfg.position);
+    WriteIniInt("Layout", "positionVer", 2);
     WriteIniInt("Layout", "opacity", cfg.opacity);
     WriteIniFloat("Layout", "customX", cfg.customX);
     WriteIniFloat("Layout", "customY", cfg.customY);
@@ -361,6 +472,12 @@ static void SaveConfig(const OverlayConfig& cfg)
     
     // GPU selection
     WriteIniInt("GPU", "selectedGpu", cfg.selectedGpu);
+
+    if (pawnioRb != 0) {
+        WriteIniInt("App", "PawnIORequiresReboot", 1);
+        if (pawnioHex[0] != '\0')
+            WriteIniStr("App", "PawnIOInstallUtcHex", pawnioHex);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -486,7 +603,7 @@ static DWORD              g_lastTargetPid = 0;    // to detect PID change
 static bool               g_etwAvailable = false;
 static bool               g_isAdmin = false;      // running as administrator?
 static double              g_qpcFreq     = 1.0;
-static char               g_targetProcessName[128] = "";  // current tracked process name
+static char               g_targetProcessName[768] = "";  // UTF-8: tracked process (exe + description)
 
 // ── CPU temperature (WMI) ──
 static float g_cpuTemp = 0.0f;
@@ -715,76 +832,80 @@ static void QueryGpuName()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Process name and description from PID
+// Process name and description from PID (UTF-8 for ImGui / Unicode paths)
 // ═══════════════════════════════════════════════════════════════════════════
-static void GetFileDescription(const char* filePath, char* outDesc, size_t maxLen)
+static void WideToUtf8(const wchar_t* w, char* out, size_t outBytes)
+{
+    if (!out || outBytes == 0) return;
+    out[0] = '\0';
+    if (!w || !w[0]) return;
+    int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, w, -1, out, (int)outBytes, nullptr, nullptr);
+    if (n <= 0)
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)outBytes, nullptr, nullptr);
+}
+
+static void GetFileDescriptionUtf8FromPathW(const wchar_t* filePathW, char* outDesc, size_t maxLen)
 {
     outDesc[0] = '\0';
-    
+    if (!filePathW || !filePathW[0]) return;
+
     DWORD dummy = 0;
-    DWORD size = GetFileVersionInfoSizeA(filePath, &dummy);
+    DWORD size = GetFileVersionInfoSizeW(filePathW, &dummy);
     if (size == 0) return;
-    
-    std::vector<char> data(size);
-    if (!GetFileVersionInfoA(filePath, 0, size, data.data())) return;
-    
-    // Try to get FileDescription
+
+    std::vector<BYTE> data(size);
+    if (!GetFileVersionInfoW(filePathW, 0, size, data.data())) return;
+
     struct LANGANDCODEPAGE {
         WORD wLanguage;
         WORD wCodePage;
-    } *lpTranslate;
+    } *lpTranslate = nullptr;
     UINT cbTranslate = 0;
-    
-    if (!VerQueryValueA(data.data(), "\\VarFileInfo\\Translation",
-                        reinterpret_cast<LPVOID*>(&lpTranslate), &cbTranslate))
+    if (!VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation",
+                         reinterpret_cast<LPVOID*>(&lpTranslate), &cbTranslate) ||
+        !lpTranslate || cbTranslate < sizeof(LANGANDCODEPAGE))
         return;
-    
-    if (cbTranslate < sizeof(LANGANDCODEPAGE)) return;
-    
-    char subBlock[128];
-    snprintf(subBlock, sizeof(subBlock),
-             "\\StringFileInfo\\%04x%04x\\FileDescription",
-             lpTranslate[0].wLanguage, lpTranslate[0].wCodePage);
-    
-    char* description = nullptr;
+
+    wchar_t subBlock[72];
+    _snwprintf_s(subBlock, _TRUNCATE, L"\\StringFileInfo\\%04x%04x\\FileDescription",
+                 lpTranslate[0].wLanguage, lpTranslate[0].wCodePage);
+
+    wchar_t* description = nullptr;
     UINT descLen = 0;
-    if (VerQueryValueA(data.data(), subBlock,
-                       reinterpret_cast<LPVOID*>(&description), &descLen)) {
-        if (description && descLen > 0 && description[0] != '\0') {
-            snprintf(outDesc, maxLen, "%s", description);
-        }
-    }
+    if (!VerQueryValueW(data.data(), subBlock, reinterpret_cast<LPVOID*>(&description), &descLen) ||
+        !description || !description[0])
+        return;
+
+    WideToUtf8(description, outDesc, maxLen);
 }
 
 static void GetProcessName(DWORD pid, char* outName, size_t maxLen)
 {
     outName[0] = '\0';
-    if (pid == 0) return;
-    
+    if (pid == 0 || maxLen == 0) return;
+
     HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-    if (!hProc) {
+    if (!hProc)
         hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc) return;
+
+    wchar_t fullPathW[MAX_PATH] = {};
+    DWORD dw = MAX_PATH;
+    if (QueryFullProcessImageNameW(hProc, 0, fullPathW, &dw)) {
+        const wchar_t* slash = wcsrchr(fullPathW, L'\\');
+        const wchar_t* exeW = slash ? (slash + 1) : fullPathW;
+
+        char exeUtf8[320] = {};
+        char descUtf8[512] = {};
+        WideToUtf8(exeW, exeUtf8, sizeof(exeUtf8));
+        GetFileDescriptionUtf8FromPathW(fullPathW, descUtf8, sizeof(descUtf8));
+
+        if (descUtf8[0])
+            snprintf(outName, maxLen, "%s (%s)", exeUtf8, descUtf8);
+        else
+            snprintf(outName, maxLen, "%s", exeUtf8);
     }
-    if (hProc) {
-        char fullPath[MAX_PATH] = {};
-        DWORD size = MAX_PATH;
-        if (QueryFullProcessImageNameA(hProc, 0, fullPath, &size)) {
-            // Extract just the filename
-            const char* exeName = strrchr(fullPath, '\\');
-            if (exeName) exeName++; else exeName = fullPath;
-            
-            // Try to get file description
-            char description[256] = {};
-            GetFileDescription(fullPath, description, sizeof(description));
-            
-            if (description[0]) {
-                snprintf(outName, maxLen, "%s (%s)", exeName, description);
-            } else {
-                snprintf(outName, maxLen, "%s", exeName);
-            }
-        }
-        CloseHandle(hProc);
-    }
+    CloseHandle(hProc);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -897,150 +1018,704 @@ static float QueryCpuTemperature()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PawnIO Driver Installation — Required for CPU temperature access
+// PawnIO Driver Installation — required for LibreHardwareMonitor
 // ═══════════════════════════════════════════════════════════════════════════
-static bool g_pawnIOPromptShown = false;  // Only show prompt once per session
+
+static HKEY OpenPawnIOUninstallKeyRead()
+{
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExA(
+            HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PawnIO",
+            0, KEY_READ, &hKey) == ERROR_SUCCESS)
+        return hKey;
+    if (RegOpenKeyExA(
+            HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PawnIO",
+            0, KEY_READ | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS)
+        return hKey;
+    return nullptr;
+}
+
+static bool RegQuerySzA(HKEY hKey, const char* valueName, char* buf, DWORD cap)
+{
+    if (!cap) return false;
+    DWORD sz = cap;
+    DWORD typ = 0;
+    if (RegQueryValueExA(hKey, valueName, nullptr, &typ,
+                         reinterpret_cast<LPBYTE>(buf), &sz) != ERROR_SUCCESS)
+        return false;
+    if (typ != REG_SZ && typ != REG_EXPAND_SZ)
+        return false;
+    buf[cap - 1] = '\0';
+    return buf[0] != '\0';
+}
 
 // Check if PawnIO driver is installed via registry
 // LibreHardwareMonitor checks: SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO
 static bool IsPawnIOInstalled()
 {
-    HKEY hKey = nullptr;
-    
-    // Try native registry first (64-bit on 64-bit Windows, 32-bit on 32-bit Windows)
-    LONG result = RegOpenKeyExA(
-        HKEY_LOCAL_MACHINE,
-        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PawnIO",
-        0, KEY_READ, &hKey
-    );
-    
-    if (result == ERROR_SUCCESS) {
-        // Check if DisplayVersion exists
-        char versionStr[64] = {0};
-        DWORD size = sizeof(versionStr);
-        DWORD type = REG_SZ;
-        result = RegQueryValueExA(hKey, "DisplayVersion", nullptr, &type, 
-                                  reinterpret_cast<LPBYTE>(versionStr), &size);
-        RegCloseKey(hKey);
-        
-        if (result == ERROR_SUCCESS && versionStr[0] != '\0') {
-            return true;
-        }
-    }
-    
-    // Try 64-bit registry view explicitly (for 32-bit apps on 64-bit Windows)
-    result = RegOpenKeyExA(
-        HKEY_LOCAL_MACHINE,
-        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PawnIO",
-        0, KEY_READ | KEY_WOW64_64KEY, &hKey
-    );
-    
-    if (result == ERROR_SUCCESS) {
-        char versionStr[64] = {0};
-        DWORD size = sizeof(versionStr);
-        DWORD type = REG_SZ;
-        result = RegQueryValueExA(hKey, "DisplayVersion", nullptr, &type,
-                                  reinterpret_cast<LPBYTE>(versionStr), &size);
-        RegCloseKey(hKey);
-        
-        if (result == ERROR_SUCCESS && versionStr[0] != '\0') {
-            return true;
-        }
-    }
-    
-    return false;
+    HKEY hKey = OpenPawnIOUninstallKeyRead();
+    if (!hKey)
+        return false;
+    char versionStr[64] = {0};
+    bool ok = RegQuerySzA(hKey, "DisplayVersion", versionStr, sizeof(versionStr));
+    RegCloseKey(hKey);
+    return ok;
 }
 
-// Extract embedded PawnIO_setup.exe and run it
-static bool ExtractAndRunPawnIOSetup()
+static bool GetFileVersionQuad(const char* path, DWORD* verMS, DWORD* verLS)
+{
+    if (!path || !path[0] || !verMS || !verLS)
+        return false;
+    DWORD dummy = 0;
+    DWORD verSize = GetFileVersionInfoSizeA(path, &dummy);
+    if (!verSize)
+        return false;
+    std::vector<BYTE> data(verSize);
+    if (!GetFileVersionInfoA(path, 0, verSize, data.data()))
+        return false;
+    VS_FIXEDFILEINFO* ffi = nullptr;
+    UINT ffiLen = 0;
+    if (!VerQueryValueA(data.data(), "\\", reinterpret_cast<void**>(&ffi), &ffiLen) || !ffi ||
+        ffiLen < sizeof(VS_FIXEDFILEINFO))
+        return false;
+    *verMS = ffi->dwFileVersionMS;
+    *verLS = ffi->dwFileVersionLS;
+    return (*verMS | *verLS) != 0;
+}
+
+// Write embedded PawnIO_setup.exe bytes to an absolute path (overwrites).
+static bool WriteEmbeddedPawnIOSetupToPath(const char* destPath)
 {
     HMODULE hModule = GetModuleHandle(nullptr);
     HRSRC hResource = FindResource(hModule, MAKEINTRESOURCE(IDR_PAWNIO_SETUP), RT_RCDATA);
-    if (!hResource) {
+    if (!hResource)
         return false;
-    }
-    
     HGLOBAL hLoadedResource = LoadResource(hModule, hResource);
-    if (!hLoadedResource) {
+    if (!hLoadedResource)
         return false;
-    }
-    
     LPVOID pResourceData = LockResource(hLoadedResource);
     DWORD dwResourceSize = SizeofResource(hModule, hResource);
-    if (!pResourceData || dwResourceSize == 0) {
+    if (!pResourceData || dwResourceSize == 0)
         return false;
-    }
-    
-    // Get temp directory and create path for the installer
-    char tempPath[MAX_PATH];
-    char tempFile[MAX_PATH];
-    GetTempPathA(MAX_PATH, tempPath);
-    snprintf(tempFile, MAX_PATH, "%sPawnIO_setup.exe", tempPath);
-    
-    // Write the resource to a temp file
-    HANDLE hFile = CreateFileA(tempFile, GENERIC_WRITE, 0, nullptr, 
-                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
+    HANDLE hFile = CreateFileA(destPath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE)
         return false;
-    }
-    
-    DWORD bytesWritten;
+    DWORD bytesWritten = 0;
     BOOL writeResult = WriteFile(hFile, pResourceData, dwResourceSize, &bytesWritten, nullptr);
     CloseHandle(hFile);
-    
     if (!writeResult || bytesWritten != dwResourceSize) {
-        DeleteFileA(tempFile);
+        DeleteFileA(destPath);
         return false;
     }
-    
-    // Run the installer silently with -install flag and wait for it to complete
-    SHELLEXECUTEINFOA sei = { sizeof(sei) };
-    sei.lpVerb = "runas";  // Request elevation
-    sei.lpFile = tempFile;
-    sei.lpParameters = "-install";  // Silent install flag
-    sei.nShow = SW_HIDE;  // Hide the installer window
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-    
-    if (ShellExecuteExA(&sei)) {
-        // Wait for the installer to finish
-        if (sei.hProcess) {
-            WaitForSingleObject(sei.hProcess, INFINITE);
-            CloseHandle(sei.hProcess);
-        }
-        
-        // Clean up temp file
-        DeleteFileA(tempFile);
-        return true;
-    }
-    
+    return true;
+}
+
+static bool GetBundledPawnIOSetupVersion(DWORD* verMS, DWORD* verLS)
+{
+    char tempPath[MAX_PATH];
+    char tempFile[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, tempPath) == 0)
+        return false;
+    snprintf(tempFile, MAX_PATH, "%sFPSOverlay_PawnIO_setup_%llu.exe", tempPath,
+             (unsigned long long)GetTickCount64());
+    if (!WriteEmbeddedPawnIOSetupToPath(tempFile))
+        return false;
+    bool ok = GetFileVersionQuad(tempFile, verMS, verLS);
     DeleteFileA(tempFile);
+    return ok;
+}
+
+static void StripPathFromDisplayIcon(const char* raw, char* out, size_t cap)
+{
+    if (!cap) return;
+    out[0] = '\0';
+    if (!raw || !raw[0]) return;
+    const char* p = raw;
+    if (*p == '"') {
+        ++p;
+        const char* q = strchr(p, '"');
+        if (q) {
+            size_t n = (size_t)(q - p);
+            if (n >= cap) n = cap - 1;
+            memcpy(out, p, n);
+            out[n] = '\0';
+        }
+        return;
+    }
+    const char* comma = strchr(p, ',');
+    size_t n = comma ? (size_t)(comma - p) : strlen(p);
+    while (n > 0 && (p[n - 1] == ' ' || p[n - 1] == '\t')) n--;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+}
+
+static void ExtractFirstQuotedPath(const char* raw, char* out, size_t cap)
+{
+    if (!cap) return;
+    out[0] = '\0';
+    if (!raw || !raw[0]) return;
+    while (*raw == ' ' || *raw == '\t') ++raw;
+    if (*raw == '"') {
+        StripPathFromDisplayIcon(raw, out, cap);
+        return;
+    }
+    const char* sp = raw;
+    const char* end = raw;
+    while (*end && *end != ' ' && *end != '\t') ++end;
+    size_t n = (size_t)(end - sp);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, sp, n);
+    out[n] = '\0';
+}
+
+static bool PathFileExistsA_(const char* p)
+{
+    return p && p[0] && GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES;
+}
+
+static bool TryJoinExe(char* out, size_t cap, const char* dir, const char* exeName)
+{
+    if (!dir || !dir[0]) return false;
+    size_t len = strlen(dir);
+    while (len > 0 && (dir[len - 1] == '\\' || dir[len - 1] == '/')) len--;
+    int n = snprintf(out, cap, "%.*s\\%s", (int)len, dir, exeName);
+    return n > 0 && (size_t)n < cap && PathFileExistsA_(out);
+}
+
+static bool ParseDisplayVersionToQuad(const char* s, DWORD* verMS, DWORD* verLS)
+{
+    if (!s || !verMS || !verLS) return false;
+    while (*s == ' ' || *s == '\t') ++s;
+    if (*s == 'v' || *s == 'V') ++s;
+    int v[4] = {0, 0, 0, 0};
+    int n = 0;
+    const char* p = s;
+    while (n < 4 && *p) {
+        char* end = nullptr;
+        long x = strtol(p, &end, 10);
+        if (end == p) break;
+        v[n++] = (int)x;
+        p = end;
+        if (*p == '.' || *p == ',') ++p;
+        else if (*p == '-' || *p == '+') break;
+        else if (*p && (*p < '0' || *p > '9')) break;
+    }
+    if (n == 0) return false;
+    WORD maj = (WORD)(n >= 1 ? v[0] : 0);
+    WORD minr = (WORD)(n >= 2 ? v[1] : 0);
+    WORD pat = (WORD)(n >= 3 ? v[2] : 0);
+    WORD bld = (WORD)(n >= 4 ? v[3] : 0);
+    *verMS = ((DWORD)maj << 16) | (DWORD)minr;
+    *verLS = ((DWORD)pat << 16) | (DWORD)bld;
+    return true;
+}
+
+// Installed version: prefer file version from uninstall-related paths, else DisplayVersion string.
+static bool GetInstalledPawnIOVersionQuad(DWORD* verMS, DWORD* verLS)
+{
+    if (!verMS || !verLS) return false;
+    *verMS = *verLS = 0;
+    HKEY hKey = OpenPawnIOUninstallKeyRead();
+    if (!hKey)
+        return false;
+
+    char buf512[512];
+    char path[MAX_PATH];
+
+    auto tryPath = [&](const char* candidate) -> bool {
+        if (!candidate || !candidate[0]) return false;
+        if (!PathFileExistsA_(candidate)) return false;
+        return GetFileVersionQuad(candidate, verMS, verLS);
+    };
+
+    bool got = false;
+    if (RegQuerySzA(hKey, "DisplayIcon", buf512, sizeof(buf512))) {
+        StripPathFromDisplayIcon(buf512, path, sizeof(path));
+        got = tryPath(path);
+    }
+    if (!got) {
+        DWORD typ = 0;
+        DWORD sz = sizeof(buf512);
+        if (RegQueryValueExA(hKey, "InstallLocation", nullptr, &typ,
+                             reinterpret_cast<LPBYTE>(buf512), &sz) == ERROR_SUCCESS &&
+            (typ == REG_SZ || typ == REG_EXPAND_SZ) && buf512[0]) {
+            buf512[sizeof(buf512) - 1] = '\0';
+            if (typ == REG_EXPAND_SZ) {
+                char expanded[512];
+                if (ExpandEnvironmentStringsA(buf512, expanded, sizeof(expanded)) > 1)
+                    snprintf(buf512, sizeof(buf512), "%s", expanded);
+            }
+            if (TryJoinExe(path, sizeof(path), buf512, "PawnIO.exe") && tryPath(path)) got = true;
+            if (!got && TryJoinExe(path, sizeof(path), buf512, "PawnIO_setup.exe") && tryPath(path)) got = true;
+        }
+    }
+    if (!got && RegQuerySzA(hKey, "UninstallString", buf512, sizeof(buf512))) {
+        ExtractFirstQuotedPath(buf512, path, sizeof(path));
+        if (!got && tryPath(path)) got = true;
+    }
+    if (!got)
+        got = tryPath("C:\\Windows\\System32\\drivers\\PawnIO.sys");
+
+    char disp[64] = {0};
+    if (!got && RegQuerySzA(hKey, "DisplayVersion", disp, sizeof(disp)))
+        got = ParseDisplayVersionToQuad(disp, verMS, verLS);
+
+    RegCloseKey(hKey);
+    return got && (*verMS != 0 || *verLS != 0);
+}
+
+static int CompareFileVersionQuad(DWORD aMS, DWORD aLS, DWORD bMS, DWORD bLS)
+{
+    if (aMS != bMS) return (aMS > bMS) ? 1 : -1;
+    if (aLS != bLS) return (aLS > bLS) ? 1 : -1;
+    return 0;
+}
+
+// Win32_OperatingSystem.LastBootUpTime as CIM datetime -> FILETIME (UTC).
+// The trailing +/-minutes is the WMI UTC offset; ignoring it made last boot look "newer" than the
+// install marker and cleared PawnIORequiresReboot incorrectly on some locales.
+static bool CimDateTimeStringToFileTimeUtc(const wchar_t* wsz, FILETIME* pft)
+{
+    if (!wsz || !pft) return false;
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+    if (swscanf_s(wsz, L"%4d%2d%2d%2d%2d%2d", &y, &mo, &d, &h, &mi, &s) != 6)
+        return false;
+
+    int biasMin = 0;
+    const wchar_t* dot = wcschr(wsz, L'.');
+    if (dot) {
+        const wchar_t* p = dot + 1;
+        while (*p && iswdigit(*p)) ++p;
+        if (*p == L'+' || *p == L'-')
+            biasMin = _wtoi(p);
+    } else {
+        const wchar_t* q = wsz + 14;
+        while (*q && *q != L'+' && *q != L'-') ++q;
+        if (*q == L'+' || *q == L'-')
+            biasMin = _wtoi(q);
+    }
+
+    struct tm t = {};
+    t.tm_year = y - 1900;
+    t.tm_mon = mo - 1;
+    t.tm_mday = d;
+    t.tm_hour = h;
+    t.tm_min = mi;
+    t.tm_sec = s;
+    time_t tt = _mkgmtime(&t);
+    if (tt == (time_t)-1) return false;
+    tt -= (time_t)biasMin * 60;
+
+    ULARGE_INTEGER u;
+    u.QuadPart = (unsigned long long)(tt + 11644473600LL) * 10000000ULL;
+    *pft = *(FILETIME*)&u;
+    return true;
+}
+
+static bool WmiQueryLastBootUtcFileTime(FILETIME* pft)
+{
+    if (!pft) return false;
+    pft->dwLowDateTime = pft->dwHighDateTime = 0;
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool comNeedsUninit = SUCCEEDED(hrInit);
+    if (FAILED(hrInit) && hrInit != RPC_E_CHANGED_MODE)
+        return false;
+
+    IWbemLocator* pLoc = nullptr;
+    IWbemServices* pSvc = nullptr;
+    IEnumWbemClassObject* pEnum = nullptr;
+    IWbemClassObject* pObj = nullptr;
+    VARIANT vt;
+    VariantInit(&vt);
+    ULONG ret = 0;
+    bool ok = false;
+
+    HRESULT hr = CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER, IID_IWbemLocator,
+                                  reinterpret_cast<void**>(&pLoc));
+    if (FAILED(hr) || !pLoc) goto wmi_cleanup;
+
+    hr = pLoc->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), nullptr, nullptr, nullptr, 0, nullptr, nullptr, &pSvc);
+    if (FAILED(hr) || !pSvc) goto wmi_cleanup;
+
+    hr = CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr, RPC_C_AUTHN_LEVEL_CALL,
+                           RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
+    if (FAILED(hr)) goto wmi_cleanup;
+
+    hr = pSvc->ExecQuery(_bstr_t(L"WQL"), _bstr_t(L"SELECT LastBootUpTime FROM Win32_OperatingSystem"),
+                         WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr, &pEnum);
+    if (FAILED(hr) || !pEnum) goto wmi_cleanup;
+
+    if (pEnum->Next(WBEM_INFINITE, 1, &pObj, &ret) != S_OK || !pObj) goto wmi_cleanup;
+
+    hr = pObj->Get(L"LastBootUpTime", 0, &vt, nullptr, nullptr);
+    if (FAILED(hr)) goto wmi_cleanup;
+    if (vt.vt == VT_BSTR && vt.bstrVal)
+        ok = CimDateTimeStringToFileTimeUtc(vt.bstrVal, pft);
+
+wmi_cleanup:
+    VariantClear(&vt);
+    if (pObj) pObj->Release();
+    if (pEnum) pEnum->Release();
+    if (pSvc) pSvc->Release();
+    if (pLoc) pLoc->Release();
+    if (comNeedsUninit) CoUninitialize();
+    return ok;
+}
+
+static bool CommitPawnIORebootPendingToIni()
+{
+    InitConfigPath();
+    FILETIME ft = {};
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    char hex[20];
+    snprintf(hex, sizeof(hex), "%016llX", (unsigned long long)u.QuadPart);
+
+    for (int attempt = 0; attempt < 12; attempt++) {
+        if (!WritePawnIORebootPendingStateFile(hex)) {
+            Sleep(30);
+            continue;
+        }
+        WriteIniStr("App", "PawnIOInstallUtcHex", hex);
+        WriteIniInt("App", "PawnIORequiresReboot", 1);
+
+        char verifyFile[48] = {};
+        const bool fileOk =
+            ReadPawnIORebootPendingStateFile(verifyFile, sizeof(verifyFile)) && (_stricmp(verifyFile, hex) == 0);
+        if (!fileOk) {
+            Sleep(30);
+            continue;
+        }
+
+        if (ReadIniInt("App", "PawnIORequiresReboot", 0) == 0) {
+            WriteIniStr("App", "PawnIOInstallUtcHex", hex);
+            WriteIniInt("App", "PawnIORequiresReboot", 1);
+        }
+        char verify[40] = {};
+        ReadIniStr("App", "PawnIOInstallUtcHex", verify, sizeof(verify));
+        if (_stricmp(verify, hex) != 0) {
+            WriteIniStr("App", "PawnIOInstallUtcHex", hex);
+            WriteIniInt("App", "PawnIORequiresReboot", 1);
+            ReadIniStr("App", "PawnIOInstallUtcHex", verify, sizeof(verify));
+        }
+        if (ReadIniInt("App", "PawnIORequiresReboot", 0) != 0 && _stricmp(verify, hex) == 0)
+            return true;
+
+        // Sidecar is authoritative; INI can be flaky with some tools.
+        if (fileOk)
+            return true;
+
+        Sleep(30);
+    }
     return false;
 }
 
-// Show prompt to install PawnIO driver
-static bool PromptAndInstallPawnIO()
+static void ClearPawnIORebootPendingAll()
 {
-    if (g_pawnIOPromptShown) {
-        return false;  // Already prompted this session
+    InitConfigPath();
+    WriteIniInt("App", "PawnIORequiresReboot", 0);
+    WriteIniStr("App", "PawnIOInstallUtcHex", "");
+    DeletePawnIORebootPendingStateFile();
+}
+
+// Approximate last boot in the same UTC FILETIME domain as GetSystemTimeAsFileTime (install marker).
+// Avoids WMI/CIM timezone mismatches that kept the reboot gate latched after a real restart.
+static bool ApproxLastBootFromUptimeFileTime(FILETIME* pft)
+{
+    if (!pft) return false;
+    FILETIME nowFt = {};
+    GetSystemTimeAsFileTime(&nowFt);
+    ULARGE_INTEGER now;
+    now.LowPart = nowFt.dwLowDateTime;
+    now.HighPart = nowFt.dwHighDateTime;
+    const ULONGLONG uptime100ns = GetTickCount64() * 10000ULL;
+    if (uptime100ns == 0 || now.QuadPart <= uptime100ns)
+        return false;
+    ULARGE_INTEGER boot;
+    boot.QuadPart = now.QuadPart - uptime100ns;
+    pft->dwLowDateTime = boot.LowPart;
+    pft->dwHighDateTime = boot.HighPart;
+    return true;
+}
+
+// bootFt and markerFt must be comparable (same epoch). minSlack100ns avoids borderline ties.
+static bool LastBootUtcPlausiblyAfterPawnIOInstall(const FILETIME* bootFt, const FILETIME* markerFt,
+                                                   ULONGLONG minSlack100ns)
+{
+    ULARGE_INTEGER b, m;
+    b.LowPart = bootFt->dwLowDateTime;
+    b.HighPart = bootFt->dwHighDateTime;
+    m.LowPart = markerFt->dwLowDateTime;
+    m.HighPart = markerFt->dwHighDateTime;
+    if (b.QuadPart <= m.QuadPart)
+        return false;
+    return (b.QuadPart - m.QuadPart) >= minSlack100ns;
+}
+
+static bool ReadPawnIOInstallMarkerFileTime(FILETIME* pft)
+{
+    if (!pft) return false;
+    char hex[32] = {};
+    ReadIniStr("App", "PawnIOInstallUtcHex", hex, sizeof(hex));
+    if (strlen(hex) != 16) return false;
+    unsigned long long v = 0;
+    if (sscanf_s(hex, "%llx", &v) != 1) return false;
+    ULARGE_INTEGER u;
+    u.QuadPart = v;
+    pft->dwLowDateTime = u.LowPart;
+    pft->dwHighDateTime = u.HighPart;
+    return true;
+}
+
+static bool AcquireShutdownPrivilege()
+{
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+        return false;
+    TOKEN_PRIVILEGES tkp = {};
+    tkp.PrivilegeCount = 1;
+    tkp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (!LookupPrivilegeValueA(nullptr, "SeShutdownPrivilege", &tkp.Privileges[0].Luid)) {
+        CloseHandle(hToken);
+        return false;
     }
-    g_pawnIOPromptShown = true;
-    
-    int result = MessageBoxA(
-        nullptr,
-        "PawnIO driver is not installed.\n\n"
-        "This driver is required for LibreHardwareMonitor to correctly read "
-        "CPU and GPU temperatures on modern systems.\n\n"
-        "Would you like to install it now?\n\n"
-        "(You may need to restart FPS Overlay after installation)",
-        "FPS Overlay - Driver Required",
-        MB_YESNO | MB_ICONQUESTION | MB_TOPMOST
-    );
-    
-    if (result == IDYES) {
-        return ExtractAndRunPawnIOSetup();
+    BOOL ok = AdjustTokenPrivileges(hToken, FALSE, &tkp, 0, nullptr, nullptr);
+    CloseHandle(hToken);
+    return ok != FALSE;
+}
+
+// Same restart choice whenever a reboot is required (post-install / gate / WMI / bad marker).
+// MB_SYSTEMMODAL + topmost + foreground so it is not lost behind other windows.
+static void ForceShowPawnIORestartRequiredDialogThenExit(const wchar_t* situationLead)
+{
+    const UINT kMb =
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_TOPMOST | MB_SETFOREGROUND | MB_SYSTEMMODAL;
+
+    wchar_t body[2048];
+    _snwprintf_s(body, _TRUNCATE,
+                 L"%s\n\n"
+                 L"Important: save your work in other apps before restarting. Unsaved data may be lost.\n\n"
+                 L"A full system restart is required before FPS Overlay can run.\n\n"
+                 L"Yes \u2014 restart this PC now (FPS Overlay will close first)\n"
+                 L"No \u2014 restart later (FPS Overlay will close; use Start \u2192 Power \u2192 Restart when ready)\n\n",
+                 situationLead ? situationLead : L"");
+
+    const int r = MessageBoxW(nullptr, body, L"FPS Overlay \u2014 Restart required", kMb);
+
+    if (r == IDYES) {
+        if (AcquireShutdownPrivilege()) {
+            ExitWindowsEx(EWX_REBOOT | EWX_FORCEIFHUNG,
+                          SHTDN_REASON_MAJOR_APPLICATION | SHTDN_REASON_MINOR_INSTALLATION |
+                              SHTDN_REASON_FLAG_PLANNED);
+        }
+        MessageBoxW(nullptr,
+                      L"Could not start an automatic restart. Please restart your PC manually "
+                      L"(Start \u2192 Power \u2192 Restart), then start FPS Overlay again.",
+                      L"FPS Overlay",
+                      MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND | MB_SYSTEMMODAL);
     }
-    
-    return false;
+    ExitProcess(0);
+}
+
+// Block startup until Windows has rebooted since the last PawnIO install/update (config.ini [App] + sidecar state).
+static void CheckPawnIORebootGateOrExit()
+{
+    InitConfigPath();
+
+    char hex[48] = {};
+    ReadIniStr("App", "PawnIOInstallUtcHex", hex, sizeof(hex));
+    char fileHex[48] = {};
+    const bool fileOk = ReadPawnIORebootPendingStateFile(fileHex, sizeof(fileHex));
+    int rb = ReadIniInt("App", "PawnIORequiresReboot", 0);
+
+    if (fileOk) {
+        if (rb == 0 || _stricmp(hex, fileHex) != 0 || strlen(hex) != 16) {
+            WriteIniStr("App", "PawnIOInstallUtcHex", fileHex);
+            WriteIniInt("App", "PawnIORequiresReboot", 1);
+        }
+        snprintf(hex, sizeof(hex), "%s", fileHex);
+        rb = 1;
+    }
+
+    if (rb == 0)
+        return;
+
+    FILETIME marker = {};
+    if (!ReadPawnIOInstallMarkerFileTime(&marker)) {
+        ForceShowPawnIORestartRequiredDialogThenExit(
+            L"FPS Overlay is waiting for a system restart after PawnIO was installed or updated, "
+            L"but the restart marker in config.ini is missing or invalid.\n\n"
+            L"If this persists after restarting Windows, delete PawnIORequiresReboot and "
+            L"PawnIOInstallUtcHex under [App] in config.ini and delete fpsoverlay-pawnio-reboot.state "
+            L"next to overlay.exe.");
+        return;
+    }
+
+    FILETIME bootApprox = {};
+    const bool haveBootApprox = ApproxLastBootFromUptimeFileTime(&bootApprox);
+    if (haveBootApprox && LastBootUtcPlausiblyAfterPawnIOInstall(&bootApprox, &marker, 3ULL * 10000000ULL)) {
+        ClearPawnIORebootPendingAll();
+        return;
+    }
+
+    FILETIME bootWmi = {};
+    const bool haveBootWmi = WmiQueryLastBootUtcFileTime(&bootWmi);
+    if (haveBootWmi && LastBootUtcPlausiblyAfterPawnIOInstall(&bootWmi, &marker, 45ULL * 10000000ULL)) {
+        ClearPawnIORebootPendingAll();
+        return;
+    }
+
+    if (!haveBootApprox && !haveBootWmi) {
+        ForceShowPawnIORestartRequiredDialogThenExit(
+            L"FPS Overlay cannot verify that this PC has restarted since PawnIO was installed or updated "
+            L"(Windows could not report the last boot time). A full restart is still required.");
+        return;
+    }
+
+    ForceShowPawnIORestartRequiredDialogThenExit(
+        L"You must restart Windows before using FPS Overlay.\n\n"
+        L"PawnIO was installed or updated earlier, and this session has not completed a full system restart yet.");
+}
+
+// Called after PawnIO_setup exits 0 and reboot pending is already committed to config.ini.
+static void RequireSystemRestartAfterPawnIOSetup()
+{
+    ForceShowPawnIORestartRequiredDialogThenExit(L"PawnIO was installed or updated successfully.");
+}
+
+// Extract embedded PawnIO_setup.exe and run it (-install). Success only if the process exits with code 0.
+static bool ExtractAndRunPawnIOSetup()
+{
+    char tempPath[MAX_PATH];
+    char tempFile[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, tempPath) == 0)
+        return false;
+    snprintf(tempFile, MAX_PATH, "%sFPSOverlay_PawnIO_setup_run_%llu.exe", tempPath,
+             (unsigned long long)GetTickCount64());
+    if (!WriteEmbeddedPawnIOSetupToPath(tempFile))
+        return false;
+
+    SHELLEXECUTEINFOA sei = { sizeof(sei) };
+    sei.lpVerb = "runas";
+    sei.lpFile = tempFile;
+    sei.lpParameters = "-install";
+    sei.nShow = SW_HIDE;
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+
+    if (!ShellExecuteExA(&sei)) {
+        DeleteFileA(tempFile);
+        return false;
+    }
+
+    if (!sei.hProcess) {
+        DeleteFileA(tempFile);
+        return false;
+    }
+
+    WaitForSingleObject(sei.hProcess, INFINITE);
+    DWORD exitCode = (DWORD)-1;
+    if (!GetExitCodeProcess(sei.hProcess, &exitCode)) {
+        CloseHandle(sei.hProcess);
+        DeleteFileA(tempFile);
+        return false;
+    }
+    CloseHandle(sei.hProcess);
+    DeleteFileA(tempFile);
+
+    if (exitCode == STILL_ACTIVE)
+        return false;
+    return exitCode == 0;
+}
+
+// True if bundled PawnIO_setup.exe is newer than the installed build (skip if we cannot read bundled version).
+static bool IsPawnIOOutdatedVsBundled()
+{
+    DWORD bundledMS = 0, bundledLS = 0;
+    if (!GetBundledPawnIOSetupVersion(&bundledMS, &bundledLS))
+        return false;
+    DWORD installedMS = 0, installedLS = 0;
+    if (!GetInstalledPawnIOVersionQuad(&installedMS, &installedLS))
+        return false;
+    return CompareFileVersionQuad(installedMS, installedLS, bundledMS, bundledLS) < 0;
+}
+
+// Block until PawnIO is present and at least as new as the bundled installer, or exit the app.
+static void EnforcePawnIOOrExit()
+{
+    CheckPawnIORebootGateOrExit();
+
+    for (;;) {
+        if (!IsPawnIOInstalled()) {
+            int r = MessageBoxW(
+                nullptr,
+                L"The PawnIO driver is required for FPS Overlay.\n\n"
+                L"LibreHardwareMonitor uses it for CPU and GPU temperatures. "
+                L"The app cannot continue without it.\n\n"
+                L"Click OK to install PawnIO.\n"
+                L"Click Cancel to exit.",
+                L"FPS Overlay \u2014 PawnIO required",
+                MB_OKCANCEL | MB_ICONWARNING | MB_TOPMOST);
+            if (r != IDOK)
+                ExitProcess(1);
+            if (!ExtractAndRunPawnIOSetup()) {
+                MessageBoxW(nullptr,
+                              L"PawnIO setup did not finish successfully. The installer exited with an error "
+                              L"(for example, an existing PawnIO build must be removed first).\n\n"
+                              L"Uninstall PawnIO from Windows Settings \u2192 Apps \u2192 Installed apps, then click OK again here.",
+                              L"FPS Overlay", MB_OK | MB_ICONERROR | MB_TOPMOST);
+                continue;
+            }
+            if (!CommitPawnIORebootPendingToIni()) {
+                MessageBoxW(nullptr,
+                              L"FPS Overlay could not save the restart requirement (config.ini or "
+                              L"fpsoverlay-pawnio-reboot.state next to overlay.exe). Check the folder is writable, "
+                              L"then try installing PawnIO again.",
+                              L"FPS Overlay",
+                              MB_OK | MB_ICONERROR | MB_TOPMOST);
+                ExitProcess(1);
+            }
+            RequireSystemRestartAfterPawnIOSetup();
+        }
+
+        if (IsPawnIOOutdatedVsBundled()) {
+            int r = MessageBoxW(
+                nullptr,
+                L"Your PawnIO driver is older than the version bundled with FPS Overlay.\n\n"
+                L"An outdated PawnIO can break LibreHardwareMonitor (missing or wrong temperatures). "
+                L"You must update to continue.\n\n"
+                L"Click OK to update now (replaces the existing install).\n"
+                L"Click Cancel to exit.",
+                L"FPS Overlay \u2014 PawnIO update required",
+                MB_OKCANCEL | MB_ICONWARNING | MB_TOPMOST);
+            if (r != IDOK)
+                ExitProcess(1);
+            if (!ExtractAndRunPawnIOSetup()) {
+                MessageBoxW(nullptr,
+                              L"PawnIO update did not finish successfully. The installer exited with an error "
+                              L"(for example, the old version must be removed before installing again).\n\n"
+                              L"Uninstall PawnIO from Windows Settings \u2192 Apps \u2192 Installed apps, then click OK again here.",
+                              L"FPS Overlay", MB_OK | MB_ICONERROR | MB_TOPMOST);
+                continue;
+            }
+            if (!CommitPawnIORebootPendingToIni()) {
+                MessageBoxW(nullptr,
+                              L"FPS Overlay could not save the restart requirement (config.ini or "
+                              L"fpsoverlay-pawnio-reboot.state next to overlay.exe). Check the folder is writable, "
+                              L"then try updating PawnIO again.",
+                              L"FPS Overlay",
+                              MB_OK | MB_ICONERROR | MB_TOPMOST);
+                ExitProcess(1);
+            }
+            RequireSystemRestartAfterPawnIOSetup();
+        }
+        break;
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1910,14 +2585,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     // Get GPU name from DXGI adapter (fallback if LHWM doesn't provide it)
     QueryGpuName();
 
-    // Check if PawnIO driver is installed (required for temperature access on modern systems)
-    // This check happens before LHWM init so user can install it first
-    if (!IsPawnIOInstalled()) {
-        if (PromptAndInstallPawnIO()) {
-            // Driver was installed, continue with initialization
-        }
-        // If user declined, we still try to initialize - some features may work
-    }
+    // PawnIO is required: install/update (or exit) before LHWM
+    EnforcePawnIOOrExit();
     
     // LibreHardwareMonitor init can take several seconds — run it on a detached thread
     // so the settings UI appears immediately. Poll paths once g_lhwmInitFinished is set.
@@ -1944,7 +2613,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr; io.LogFilename = nullptr;
 
-    ImFont* font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 17.0f);
+    ImFontGlyphRangesBuilder glyphBuilder;
+    glyphBuilder.AddRanges(io.Fonts->GetGlyphRangesDefault());
+    glyphBuilder.AddChar((ImWchar)0x2122); // TRADE MARK SIGN
+    glyphBuilder.AddChar((ImWchar)0x00A9); // COPYRIGHT SIGN
+    glyphBuilder.AddChar((ImWchar)0x00AE); // REGISTERED SIGN
+    static ImVector<ImWchar> s_imguiGlyphRanges;
+    s_imguiGlyphRanges.clear();
+    glyphBuilder.BuildRanges(&s_imguiGlyphRanges);
+    ImFont* font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 17.0f, nullptr,
+                                                s_imguiGlyphRanges.Data);
     if (!font) { io.Fonts->Clear(); ImFontConfig fc; fc.SizePixels = 16; io.Fonts->AddFontDefault(&fc); }
 
     ApplyStyle();
@@ -2061,14 +2739,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 ImGui::SameLine();
                 ImGui::TextColored(ImVec4(.9f,.4f,.2f,1), "(needs admin!)");
             }
-            ImGui::Checkbox("  CPU Usage & Temp", &g_Config.showCPU);
-            ImGui::Checkbox("  GPU Usage & Temp", &g_Config.showGPU);
-            if (!g_lhwmInitFinished.load(std::memory_order_acquire)) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(.55f,.55f,.58f,1), "(loading…)");
-            } else if (!g_lhwmAvailable || g_gpuCount == 0) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(.9f,.4f,.2f,1), "(unavailable)");
+            ImGui::Checkbox("  CPU Usage", &g_Config.showCpuUsage);
+            ImGui::Checkbox("  CPU Temp", &g_Config.showCpuTemp);
+            ImGui::Checkbox("  GPU Usage", &g_Config.showGpuUsage);
+            ImGui::Checkbox("  GPU Temp", &g_Config.showGpuTemp);
+            {
+                const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
+                const bool lhwmBad = !g_lhwmAvailable || g_gpuCount == 0;
+                if (lhwmBusy || lhwmBad) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1),
+                                       lhwmBusy ? "(loading…)" : "(unavailable)");
+                }
             }
             ImGui::Checkbox("  GPU VRAM Usage", &g_Config.showVRAM);
             if (!g_lhwmInitFinished.load(std::memory_order_acquire)) {
@@ -2179,10 +2861,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "POSITION");
             ImGui::Spacing();
             int prevPos = g_Config.position;
-            ImGui::RadioButton("Top Left",     &g_Config.position, 0); ImGui::SameLine(0,24);
-            ImGui::RadioButton("Top Right",    &g_Config.position, 1);
-            ImGui::RadioButton("Bottom Left",  &g_Config.position, 2); ImGui::SameLine(0,24);
-            ImGui::RadioButton("Bottom Right", &g_Config.position, 3);
+            ImGui::RadioButton("Top Left", &g_Config.position, POS_TOP_LEFT);
+            ImGui::SameLine(0, 16);
+            ImGui::RadioButton("Top Center", &g_Config.position, POS_TOP_CENTER);
+            ImGui::SameLine(0, 16);
+            ImGui::RadioButton("Top Right", &g_Config.position, POS_TOP_RIGHT);
+            ImGui::RadioButton("Bottom Left", &g_Config.position, POS_BOTTOM_LEFT);
+            ImGui::SameLine(0, 16);
+            ImGui::RadioButton("Bottom Center", &g_Config.position, POS_BOTTOM_CENTER);
+            ImGui::SameLine(0, 16);
+            ImGui::RadioButton("Bottom Right", &g_Config.position, POS_BOTTOM_RIGHT);
             // Reset custom position when corner preset is changed
             if (g_Config.position != prevPos) {
                 g_Config.customX = -1.0f;
@@ -2505,10 +3193,30 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 // Use corner preset (coordinates within primary monitor work area)
                 switch (g_Config.position) {
                     default:
-                    case 0: pos = ImVec2(wx + margin,       wy + margin);       pivot = {0, 0}; break;
-                    case 1: pos = ImVec2(wx + sw - margin, wy + margin);       pivot = {1, 0}; break;
-                    case 2: pos = ImVec2(wx + margin,       wy + sh - margin); pivot = {0, 1}; break;
-                    case 3: pos = ImVec2(wx + sw - margin, wy + sh - margin); pivot = {1, 1}; break;
+                    case POS_TOP_LEFT:
+                        pos = ImVec2(wx + margin, wy + margin);
+                        pivot = {0, 0};
+                        break;
+                    case POS_TOP_CENTER:
+                        pos = ImVec2(wx + sw * 0.5f, wy + margin);
+                        pivot = {0.5f, 0};
+                        break;
+                    case POS_TOP_RIGHT:
+                        pos = ImVec2(wx + sw - margin, wy + margin);
+                        pivot = {1, 0};
+                        break;
+                    case POS_BOTTOM_LEFT:
+                        pos = ImVec2(wx + margin, wy + sh - margin);
+                        pivot = {0, 1};
+                        break;
+                    case POS_BOTTOM_CENTER:
+                        pos = ImVec2(wx + sw * 0.5f, wy + sh - margin);
+                        pivot = {0.5f, 1};
+                        break;
+                    case POS_BOTTOM_RIGHT:
+                        pos = ImVec2(wx + sw - margin, wy + sh - margin);
+                        pivot = {1, 1};
+                        break;
                 }
             }
             
@@ -2648,7 +3356,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     needSep = true;
                 }
 
-                if (g_Config.showCPU) {
+                const bool wantCpuHzSt = g_Config.showCpuFreq && g_Config.cpuFreqPath[0] && g_lhwmAvailable;
+                if (g_Config.showCpuUsage || g_Config.showCpuTemp || wantCpuHzSt) {
                     if (needSep) {
                         ImGui::SameLine(0, hs);
                         ImGui::TextColored(sepC, "|");
@@ -2656,26 +3365,40 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     }
                     ImGui::TextColored(labCpu, "CPU");
                     ImGui::SameLine(0, hsTight);
-                    ImGui::TextColored(ColorByLoad(cpuUsage), "%.0f%%", cpuUsage);
-                    if (g_cpuTempAvailable && g_cpuTemp > 0) {
-                        ImGui::SameLine(0, 2.f * ss);
-                        float dispTemp = ToDisplayTemp(g_cpuTemp, g_Config.useFahrenheit);
-                        ImVec4 tc = g_cpuTemp > 85 ? ImVec4(1, .3f, .3f, 1)
-                                  : g_cpuTemp > 70 ? ImVec4(1, .85f, .15f, 1)
-                                                   : ImVec4(.70f, .70f, .75f, 1);
-                        ImGui::TextColored(tc, " %.0f\xC2\xB0%s", dispTemp, g_Config.useFahrenheit ? "F" : "C");
+                    bool anyCpuSteam = false;
+                    if (g_Config.showCpuUsage) {
+                        ImGui::TextColored(ColorByLoad(cpuUsage), "%.0f%%", cpuUsage);
+                        anyCpuSteam = true;
                     }
-                    if (g_Config.showCpuFreq && g_Config.cpuFreqPath[0] && g_lhwmAvailable) {
-                        ImGui::SameLine(0, hsTight);
-                        ImGui::TextColored(sepC, "|");
-                        ImGui::SameLine(0, hsTight);
+                    if (g_Config.showCpuTemp) {
+                        if (g_cpuTempAvailable && g_cpuTemp > 0) {
+                            if (anyCpuSteam) ImGui::SameLine(0, 2.f * ss);
+                            float dispTemp = ToDisplayTemp(g_cpuTemp, g_Config.useFahrenheit);
+                            ImVec4 tc = g_cpuTemp > 85 ? ImVec4(1, .3f, .3f, 1)
+                                      : g_cpuTemp > 70 ? ImVec4(1, .85f, .15f, 1)
+                                                       : ImVec4(.70f, .70f, .75f, 1);
+                            ImGui::TextColored(tc, "%s%.0f\xC2\xB0%s", anyCpuSteam ? " " : "", dispTemp,
+                                               g_Config.useFahrenheit ? "F" : "C");
+                            anyCpuSteam = true;
+                        } else if (!g_Config.showCpuUsage) {
+                            ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1.f), "---");
+                            anyCpuSteam = true;
+                        }
+                    }
+                    if (wantCpuHzSt) {
+                        if (anyCpuSteam) {
+                            ImGui::SameLine(0, hsTight);
+                            ImGui::TextColored(sepC, "|");
+                            ImGui::SameLine(0, hsTight);
+                        }
                         InlineFreqSparkMHz("##st_cpu", g_cpuSpark, g_cpuSparkN, g_cpuClockMHz,
                                            ImVec2(38.f * ss, 11.f * ss), 5.f * ss, ImVec4(.75f, .75f, .78f, 1.f));
                     }
                     needSep = true;
                 }
 
-                if (g_Config.showGPU) {
+                const bool wantGpuHzSt = g_Config.showGpuCoreFreq && g_Config.gpuCoreFreqPath[0] && g_lhwmAvailable;
+                if (g_Config.showGpuUsage || g_Config.showGpuTemp || wantGpuHzSt) {
                     if (needSep) {
                         ImGui::SameLine(0, hs);
                         ImGui::TextColored(sepC, "|");
@@ -2687,19 +3410,32 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     ImGui::TextColored(labGpu, "GPU");
                     ImGui::SameLine(0, hsTight);
                     if (hasGpuData) {
-                        ImGui::TextColored(ColorByLoad(dispGpuLoad), "%.0f%%", dispGpuLoad);
-                        if (dispGpuTemp > 0) {
-                            ImGui::SameLine(0, 2.f * ss);
-                            float dispTemp = ToDisplayTemp(dispGpuTemp, g_Config.useFahrenheit);
-                            ImVec4 tc = dispGpuTemp > 85 ? ImVec4(1, .3f, .3f, 1)
-                                      : dispGpuTemp > 70 ? ImVec4(1, .85f, .15f, 1)
-                                                         : ImVec4(.70f, .70f, .75f, 1);
-                            ImGui::TextColored(tc, " %.0f\xC2\xB0%s", dispTemp, g_Config.useFahrenheit ? "F" : "C");
+                        bool anyGpuSteam = false;
+                        if (g_Config.showGpuUsage) {
+                            ImGui::TextColored(ColorByLoad(dispGpuLoad), "%.0f%%", dispGpuLoad);
+                            anyGpuSteam = true;
                         }
-                        if (g_Config.showGpuCoreFreq && g_Config.gpuCoreFreqPath[0] && g_lhwmAvailable) {
-                            ImGui::SameLine(0, hsTight);
-                            ImGui::TextColored(sepC, "|");
-                            ImGui::SameLine(0, hsTight);
+                        if (g_Config.showGpuTemp) {
+                            if (dispGpuTemp > 0) {
+                                if (anyGpuSteam) ImGui::SameLine(0, 2.f * ss);
+                                float dispTemp = ToDisplayTemp(dispGpuTemp, g_Config.useFahrenheit);
+                                ImVec4 tc = dispGpuTemp > 85 ? ImVec4(1, .3f, .3f, 1)
+                                          : dispGpuTemp > 70 ? ImVec4(1, .85f, .15f, 1)
+                                                             : ImVec4(.70f, .70f, .75f, 1);
+                                ImGui::TextColored(tc, "%s%.0f\xC2\xB0%s", anyGpuSteam ? " " : "", dispTemp,
+                                                   g_Config.useFahrenheit ? "F" : "C");
+                                anyGpuSteam = true;
+                            } else if (!g_Config.showGpuUsage) {
+                                ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1.f), "---");
+                                anyGpuSteam = true;
+                            }
+                        }
+                        if (wantGpuHzSt) {
+                            if (anyGpuSteam) {
+                                ImGui::SameLine(0, hsTight);
+                                ImGui::TextColored(sepC, "|");
+                                ImGui::SameLine(0, hsTight);
+                            }
                             InlineFreqSparkMHz("##st_gpu", g_gpuSpark, g_gpuSparkN, g_gpuCoreClockMHz,
                                                ImVec2(38.f * ss, 11.f * ss), 5.f * ss, ImVec4(.75f, .75f, .78f, 1.f));
                         }
@@ -2762,56 +3498,95 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 }
                 
                 // CPU
-                if (g_Config.showCPU) {
-                    if (needSep) { ImGui::SameLine(); ImGui::TextColored(ImVec4(.35f,.35f,.40f,1), " | "); ImGui::SameLine(); }
-                    ImGui::TextColored(ColorByLoad(cpuUsage), "CPU %.0f%%", cpuUsage);
-                    if (g_cpuTempAvailable && g_cpuTemp > 0) {
-                        ImGui::SameLine(0, 2);
-                        float dispTemp = ToDisplayTemp(g_cpuTemp, g_Config.useFahrenheit);
-                        ImVec4 tc = g_cpuTemp > 85 ? ImVec4(1,.3f,.3f,1)
-                                  : g_cpuTemp > 70 ? ImVec4(1,.85f,.15f,1)
-                                                   : ImVec4(.70f,.70f,.75f,1);
-                        ImGui::TextColored(tc, " %.0f\xC2\xB0%s", dispTemp, g_Config.useFahrenheit ? "F" : "C");
-                    }
-                    if (g_Config.showCpuFreq && g_Config.cpuFreqPath[0] && g_lhwmAvailable) {
-                        ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(.35f,.35f,.40f,1), " | ");
-                        ImGui::SameLine();
-                        InlineFreqSparkMHz("##hz_cpu", g_cpuSpark, g_cpuSparkN, g_cpuClockMHz,
-                                           ImVec2(52.f * ovSc, 12.f * ovSc), 6.f * ovSc, ImVec4(.62f, .62f, .68f, 1.f));
-                    }
-                    needSep = true;
-                }
-                
-                // GPU stats via LHWM
-                if (g_Config.showGPU) {
-                    if (needSep) { ImGui::SameLine(); ImGui::TextColored(ImVec4(.35f,.35f,.40f,1), " | "); ImGui::SameLine(); }
-                    
-                    float dispGpuLoad = g_gpuUsage;
-                    float dispGpuTemp = g_gpuTemp;
-                    bool hasGpuData = g_lhwmAvailable && g_gpuCount > 0;
-                    
-                    if (hasGpuData) {
-                        ImGui::TextColored(ColorByLoad(dispGpuLoad), "GPU %.0f%%", dispGpuLoad);
-                        if (dispGpuTemp > 0) {
+                {
+                    const bool wantCpuHzHz =
+                        g_Config.showCpuFreq && g_Config.cpuFreqPath[0] && g_lhwmAvailable;
+                    if (g_Config.showCpuUsage || g_Config.showCpuTemp || wantCpuHzHz) {
+                        if (needSep) {
+                            ImGui::SameLine();
+                            ImGui::TextColored(ImVec4(.35f, .35f, .40f, 1), " | ");
+                            ImGui::SameLine();
+                        }
+                        const bool hasCpuTempVal = g_cpuTempAvailable && g_cpuTemp > 0;
+                        if (g_Config.showCpuUsage)
+                            ImGui::TextColored(ColorByLoad(cpuUsage), "CPU %.0f%%", cpuUsage);
+                        else if (g_Config.showCpuTemp || wantCpuHzHz)
+                            ImGui::TextColored(ImVec4(.78f, .78f, .82f, 1), "CPU");
+
+                        if (g_Config.showCpuTemp && hasCpuTempVal) {
+                            float dispTemp = ToDisplayTemp(g_cpuTemp, g_Config.useFahrenheit);
+                            ImVec4 tc = g_cpuTemp > 85 ? ImVec4(1, .3f, .3f, 1)
+                                      : g_cpuTemp > 70 ? ImVec4(1, .85f, .15f, 1)
+                                                       : ImVec4(.70f, .70f, .75f, 1);
+                            if (g_Config.showCpuUsage) ImGui::SameLine(0, 2);
+                            else ImGui::SameLine(0, 4);
+                            ImGui::TextColored(tc, "%.0f\xC2\xB0%s", dispTemp,
+                                               g_Config.useFahrenheit ? "F" : "C");
+                        } else if (g_Config.showCpuTemp && !g_Config.showCpuUsage) {
                             ImGui::SameLine(0, 2);
-                            float dispTemp = ToDisplayTemp(dispGpuTemp, g_Config.useFahrenheit);
-                            ImVec4 tc = dispGpuTemp > 85 ? ImVec4(1,.3f,.3f,1)
-                                      : dispGpuTemp > 70 ? ImVec4(1,.85f,.15f,1)
-                                                         : ImVec4(.70f,.70f,.75f,1);
-                            ImGui::TextColored(tc, " %.0f\xC2\xB0%s", dispTemp, g_Config.useFahrenheit ? "F" : "C");
+                            ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1), "---");
                         }
-                        if (g_Config.showGpuCoreFreq && g_Config.gpuCoreFreqPath[0] && g_lhwmAvailable) {
+
+                        if (wantCpuHzHz) {
                             ImGui::SameLine();
-                            ImGui::TextColored(ImVec4(.35f,.35f,.40f,1), " | ");
+                            ImGui::TextColored(ImVec4(.35f, .35f, .40f, 1), " | ");
                             ImGui::SameLine();
-                            InlineFreqSparkMHz("##hz_gpu", g_gpuSpark, g_gpuSparkN, g_gpuCoreClockMHz,
-                                               ImVec2(52.f * ovSc, 12.f * ovSc), 6.f * ovSc, ImVec4(.62f, .62f, .68f, 1.f));
+                            InlineFreqSparkMHz("##hz_cpu", g_cpuSpark, g_cpuSparkN, g_cpuClockMHz,
+                                               ImVec2(52.f * ovSc, 12.f * ovSc), 6.f * ovSc,
+                                               ImVec4(.62f, .62f, .68f, 1.f));
                         }
-                    } else {
-                        ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "GPU N/A");
+                        needSep = true;
                     }
-                    needSep = true;
+                }
+
+                // GPU stats via LHWM
+                {
+                    const bool wantGpuHzHz =
+                        g_Config.showGpuCoreFreq && g_Config.gpuCoreFreqPath[0] && g_lhwmAvailable;
+                    if (g_Config.showGpuUsage || g_Config.showGpuTemp || wantGpuHzHz) {
+                        if (needSep) {
+                            ImGui::SameLine();
+                            ImGui::TextColored(ImVec4(.35f, .35f, .40f, 1), " | ");
+                            ImGui::SameLine();
+                        }
+
+                        float dispGpuLoad = g_gpuUsage;
+                        float dispGpuTemp = g_gpuTemp;
+                        bool hasGpuData = g_lhwmAvailable && g_gpuCount > 0;
+
+                        if (hasGpuData) {
+                            if (g_Config.showGpuUsage)
+                                ImGui::TextColored(ColorByLoad(dispGpuLoad), "GPU %.0f%%", dispGpuLoad);
+                            else if (g_Config.showGpuTemp || wantGpuHzHz)
+                                ImGui::TextColored(ImVec4(.78f, .78f, .82f, 1), "GPU");
+
+                            if (g_Config.showGpuTemp && dispGpuTemp > 0) {
+                                float dispTemp = ToDisplayTemp(dispGpuTemp, g_Config.useFahrenheit);
+                                ImVec4 tc = dispGpuTemp > 85 ? ImVec4(1, .3f, .3f, 1)
+                                          : dispGpuTemp > 70 ? ImVec4(1, .85f, .15f, 1)
+                                                             : ImVec4(.70f, .70f, .75f, 1);
+                                if (g_Config.showGpuUsage) ImGui::SameLine(0, 2);
+                                else ImGui::SameLine(0, 4);
+                                ImGui::TextColored(tc, "%.0f\xC2\xB0%s", dispTemp,
+                                                   g_Config.useFahrenheit ? "F" : "C");
+                            } else if (g_Config.showGpuTemp && !g_Config.showGpuUsage) {
+                                ImGui::SameLine(0, 2);
+                                ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1), "---");
+                            }
+
+                            if (wantGpuHzHz) {
+                                ImGui::SameLine();
+                                ImGui::TextColored(ImVec4(.35f, .35f, .40f, 1), " | ");
+                                ImGui::SameLine();
+                                InlineFreqSparkMHz("##hz_gpu", g_gpuSpark, g_gpuSparkN, g_gpuCoreClockMHz,
+                                                   ImVec2(52.f * ovSc, 12.f * ovSc), 6.f * ovSc,
+                                                   ImVec4(.62f, .62f, .68f, 1.f));
+                            }
+                        } else {
+                            ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1), "GPU N/A");
+                        }
+                        needSep = true;
+                    }
                 }
                 
                 // VRAM
@@ -2874,70 +3649,104 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 }
 
                 // CPU
-                if (g_Config.showCPU) {
-                    if (needSep) { ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing(); }
-                    ImGui::TextColored(ColorByLoad(cpuUsage), "CPU  %.0f%%", cpuUsage);
-                    // Show CPU temp if available
-                    if (g_cpuTempAvailable && g_cpuTemp > 0) {
-                        ImGui::SameLine();
-                        float dispTemp = ToDisplayTemp(g_cpuTemp, g_Config.useFahrenheit);
-                        ImVec4 tc = g_cpuTemp > 85 ? ImVec4(1,.3f,.3f,1)
-                                  : g_cpuTemp > 70 ? ImVec4(1,.85f,.15f,1)
-                                                   : ImVec4(.70f,.70f,.75f,1);
-                        ImGui::TextColored(tc, " %.0f\xC2\xB0%s", dispTemp, g_Config.useFahrenheit ? "F" : "C");
+                {
+                    const bool wantCpuHzV =
+                        g_Config.showCpuFreq && g_Config.cpuFreqPath[0] && g_lhwmAvailable;
+                    if (g_Config.showCpuUsage || g_Config.showCpuTemp || wantCpuHzV) {
+                        if (needSep) {
+                            ImGui::Spacing();
+                            ImGui::Separator();
+                            ImGui::Spacing();
+                        }
+                        const bool hasCpuTempVal = g_cpuTempAvailable && g_cpuTemp > 0;
+                        if (g_Config.showCpuUsage)
+                            ImGui::TextColored(ColorByLoad(cpuUsage), "CPU  %.0f%%", cpuUsage);
+                        if (g_Config.showCpuTemp && hasCpuTempVal) {
+                            float dispTemp = ToDisplayTemp(g_cpuTemp, g_Config.useFahrenheit);
+                            ImVec4 tc = g_cpuTemp > 85 ? ImVec4(1, .3f, .3f, 1)
+                                      : g_cpuTemp > 70 ? ImVec4(1, .85f, .15f, 1)
+                                                       : ImVec4(.70f, .70f, .75f, 1);
+                            if (g_Config.showCpuUsage) ImGui::SameLine();
+                            else ImGui::TextColored(ImVec4(.82f, .82f, .88f, 1), "CPU  ");
+                            if (!g_Config.showCpuUsage) ImGui::SameLine(0, 0);
+                            ImGui::TextColored(tc, "%.0f\xC2\xB0%s", dispTemp,
+                                               g_Config.useFahrenheit ? "F" : "C");
+                        } else if (g_Config.showCpuTemp && !g_Config.showCpuUsage) {
+                            ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1), "CPU  ---");
+                        }
+
+                        ImGui::SetWindowFontScale(0.82f * ovSc);
+                        ImGui::TextColored(ImVec4(.42f, .42f, .48f, 1), "  %s", g_cpuName);
+                        ImGui::SetWindowFontScale(ovSc);
+                        if (wantCpuHzV) {
+                            ImGui::Dummy(ImVec2(0, 3.f * ovSc));
+                            ImGui::TextColored(ImVec4(.48f, .58f, .65f, 1), "CPU MHz");
+                            ImGui::SameLine();
+                            DrawMiniSpark("##vsp_cpu", g_cpuSpark, g_cpuSparkN, g_cpuClockMHz,
+                                          ImVec2(130.f * ovSc, 24.f * ovSc));
+                        }
+                        needSep = true;
                     }
-                    ImGui::SetWindowFontScale(0.82f * ovSc);
-                    ImGui::TextColored(ImVec4(.42f,.42f,.48f,1), "  %s", g_cpuName);
-                    ImGui::SetWindowFontScale(ovSc);
-                    if (g_Config.showCpuFreq && g_Config.cpuFreqPath[0] && g_lhwmAvailable) {
-                        ImGui::Dummy(ImVec2(0, 3.f * ovSc));
-                        ImGui::TextColored(ImVec4(.48f,.58f,.65f,1), "CPU MHz");
-                        ImGui::SameLine();
-                        DrawMiniSpark("##vsp_cpu", g_cpuSpark, g_cpuSparkN, g_cpuClockMHz, ImVec2(130.f * ovSc, 24.f * ovSc));
-                    }
-                    needSep = true;
                 }
 
                 // GPU stats via LHWM
-                if (g_Config.showGPU) {
-                    if (needSep) { ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing(); }
-                    
-                    float dispGpuLoad = g_gpuUsage;
-                    float dispGpuTemp = g_gpuTemp;
-                    float dispVramUsed = g_vramUsed;
-                    float dispVramTotal = g_vramTotal;
-                    bool hasGpuData = g_lhwmAvailable && g_gpuCount > 0;
-                    
-                    if (hasGpuData) {
-                        ImGui::TextColored(ColorByLoad(dispGpuLoad), "GPU  %.0f%%", dispGpuLoad);
-                        if (dispGpuTemp > 0) {
-                            ImGui::SameLine();
-                            float dispTemp = ToDisplayTemp(dispGpuTemp, g_Config.useFahrenheit);
-                            ImVec4 tc = dispGpuTemp > 85 ? ImVec4(1,.3f,.3f,1)
-                                      : dispGpuTemp > 70 ? ImVec4(1,.85f,.15f,1)
-                                                         : ImVec4(.70f,.70f,.75f,1);
-                            ImGui::TextColored(tc, " %.0f\xC2\xB0%s", dispTemp, g_Config.useFahrenheit ? "F" : "C");
+                {
+                    const bool wantGpuHzV =
+                        g_Config.showGpuCoreFreq && g_Config.gpuCoreFreqPath[0] && g_lhwmAvailable;
+                    const bool gpuVertBlock = g_Config.showGpuUsage || g_Config.showGpuTemp || wantGpuHzV ||
+                                              (g_Config.showVRAM && g_lhwmAvailable && g_gpuCount > 0);
+                    if (gpuVertBlock) {
+                        if (needSep) {
+                            ImGui::Spacing();
+                            ImGui::Separator();
+                            ImGui::Spacing();
                         }
-                        // VRAM usage
-                        if (g_Config.showVRAM && dispVramTotal > 0) {
-                            float vramPct = (dispVramUsed / dispVramTotal) * 100.0f;
-                            ImGui::TextColored(ColorByLoad(vramPct), "VRAM %.0f%%", vramPct);
-                            ImGui::SameLine();
-                            ImGui::TextColored(ImVec4(.70f,.70f,.75f,1), " %.1f / %.0f GB", dispVramUsed, dispVramTotal);
+
+                        float dispGpuLoad = g_gpuUsage;
+                        float dispGpuTemp = g_gpuTemp;
+                        float dispVramUsed = g_vramUsed;
+                        float dispVramTotal = g_vramTotal;
+                        bool hasGpuData = g_lhwmAvailable && g_gpuCount > 0;
+
+                        if (hasGpuData) {
+                            if (g_Config.showGpuUsage)
+                                ImGui::TextColored(ColorByLoad(dispGpuLoad), "GPU  %.0f%%", dispGpuLoad);
+                            if (g_Config.showGpuTemp && dispGpuTemp > 0) {
+                                float dispTemp = ToDisplayTemp(dispGpuTemp, g_Config.useFahrenheit);
+                                ImVec4 tc = dispGpuTemp > 85 ? ImVec4(1, .3f, .3f, 1)
+                                          : dispGpuTemp > 70 ? ImVec4(1, .85f, .15f, 1)
+                                                             : ImVec4(.70f, .70f, .75f, 1);
+                                if (g_Config.showGpuUsage) ImGui::SameLine();
+                                else ImGui::TextColored(ImVec4(.82f, .82f, .88f, 1), "GPU  ");
+                                if (!g_Config.showGpuUsage) ImGui::SameLine(0, 0);
+                                ImGui::TextColored(tc, "%.0f\xC2\xB0%s", dispTemp,
+                                                   g_Config.useFahrenheit ? "F" : "C");
+                            } else if (g_Config.showGpuTemp && !g_Config.showGpuUsage) {
+                                ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1), "GPU  ---");
+                            }
+                            // VRAM usage
+                            if (g_Config.showVRAM && dispVramTotal > 0) {
+                                float vramPct = (dispVramUsed / dispVramTotal) * 100.0f;
+                                ImGui::TextColored(ColorByLoad(vramPct), "VRAM %.0f%%", vramPct);
+                                ImGui::SameLine();
+                                ImGui::TextColored(ImVec4(.70f, .70f, .75f, 1), " %.1f / %.0f GB", dispVramUsed,
+                                                   dispVramTotal);
+                            }
+                        } else {
+                            ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1), "GPU  N/A");
                         }
-                    } else {
-                        ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "GPU  N/A");
+                        ImGui::SetWindowFontScale(0.82f * ovSc);
+                        ImGui::TextColored(ImVec4(.42f, .42f, .48f, 1), "  %s", g_gpuName);
+                        ImGui::SetWindowFontScale(ovSc);
+                        if (wantGpuHzV && hasGpuData) {
+                            ImGui::Dummy(ImVec2(0, 3.f * ovSc));
+                            ImGui::TextColored(ImVec4(.48f, .58f, .65f, 1), "GPU MHz");
+                            ImGui::SameLine();
+                            DrawMiniSpark("##vsp_gpu", g_gpuSpark, g_gpuSparkN, g_gpuCoreClockMHz,
+                                          ImVec2(130.f * ovSc, 24.f * ovSc));
+                        }
+                        needSep = true;
                     }
-                    ImGui::SetWindowFontScale(0.82f * ovSc);
-                    ImGui::TextColored(ImVec4(.42f,.42f,.48f,1), "  %s", g_gpuName);
-                    ImGui::SetWindowFontScale(ovSc);
-                    if (g_Config.showGpuCoreFreq && g_Config.gpuCoreFreqPath[0] && g_lhwmAvailable && hasGpuData) {
-                        ImGui::Dummy(ImVec2(0, 3.f * ovSc));
-                        ImGui::TextColored(ImVec4(.48f,.58f,.65f,1), "GPU MHz");
-                        ImGui::SameLine();
-                        DrawMiniSpark("##vsp_gpu", g_gpuSpark, g_gpuSparkN, g_gpuCoreClockMHz, ImVec2(130.f * ovSc, 24.f * ovSc));
-                    }
-                    needSep = true;
                 }
 
                 // RAM
