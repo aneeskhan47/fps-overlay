@@ -75,9 +75,9 @@ Or build it yourself (see below).
 
 1. Run the *overlay.exe* (Administrator required)
    1. It will prompt you to install PawnIO if it's not already installed or update it if it's outdated.
-   2. You must restart your computer after the installation or updating PawnIO for FPS Overlay to work.
-   > [!INFO]
-   > PawnIO is a driver that is required for LibreHardwareMonitor to work which FPS Overlay rely on to get CPU and GPU stats. It is also used by the popular tools like OpenRGB. You can learn more about PawnIO [here](https://pawnio.eu/).
+   2. You must restart your computer after the installation or updating PawnIO for FPS Overlay to work.   
+> [!NOTE]
+> PawnIO is a driver that is required for LibreHardwareMonitor to work which FPS Overlay rely on to get CPU and GPU stats. It is also used by the popular tools like OpenRGB. You can learn more about PawnIO [here](https://pawnio.eu/).
 2. Select which stats you want to display
 3. Choose your position, layout, and hotkeys
 4. Click **Start Overlay**
