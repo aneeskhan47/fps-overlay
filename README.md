@@ -1,4 +1,4 @@
-# FPS Overlay - Lightweight Game Performance Monitor
+# FPS Overlay - Lightweight Game Performance Monitor - Anti-cheat safe
 
 A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while gaming — nothing else.
 
