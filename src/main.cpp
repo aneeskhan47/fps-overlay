@@ -1880,6 +1880,7 @@ static bool InitLHWM()
                     snprintf(g_gpuList[gpuIndex].name, sizeof(g_gpuList[gpuIndex].name), "%s", cleanName.c_str());
                     g_gpuList[gpuIndex].tempPath.clear();
                     g_gpuList[gpuIndex].loadPath.clear();
+                    g_gpuList[gpuIndex].loadPathPri = -1;
                     g_gpuList[gpuIndex].vramUsedPath.clear();
                     g_gpuList[gpuIndex].vramTotalPath.clear();
                     g_gpuList[gpuIndex].vramTotalPri = -1;
