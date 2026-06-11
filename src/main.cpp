@@ -162,6 +162,7 @@ struct GpuInfo {
     char name[256];
     std::string tempPath;      // LHWM sensor path for temperature
     std::string loadPath;      // LHWM sensor path for GPU load
+    int         loadPathPri  = -1; // higher = better match: 2=exact "GPU Core", 1=contains "GPU Core", 0=fallback
     std::string vramUsedPath;  // LHWM sensor path for VRAM used
     std::string vramTotalPath; // LHWM sensor path for VRAM total
     int         vramTotalPri = -1; // higher = better match (see VramTotalSensorPriority)
@@ -1879,6 +1880,7 @@ static bool InitLHWM()
                     snprintf(g_gpuList[gpuIndex].name, sizeof(g_gpuList[gpuIndex].name), "%s", cleanName.c_str());
                     g_gpuList[gpuIndex].tempPath.clear();
                     g_gpuList[gpuIndex].loadPath.clear();
+                    g_gpuList[gpuIndex].loadPathPri = -1;
                     g_gpuList[gpuIndex].vramUsedPath.clear();
                     g_gpuList[gpuIndex].vramTotalPath.clear();
                     g_gpuList[gpuIndex].vramTotalPri = -1;
@@ -1933,10 +1935,15 @@ static bool InitLHWM()
                         }
                     }
                     else if (sensorType == "Load") {
-                        if (sensorName.find("Core") != std::string::npos || 
-                            sensorName.find("GPU") != std::string::npos ||
-                            g_gpuList[gpuIndex].loadPath.empty()) {
-                            g_gpuList[gpuIndex].loadPath = sensorPath;
+                        // Priority: 2=exact "GPU Core", 1=contains "GPU Core", 0=any other (first fallback)
+                        // This prevents "GPU Memory Controller", "GPU Bus", "GPU Video Engine", etc.
+                        // from overwriting the correct 3D-engine load sensor.
+                        int pri = (sensorName == "GPU Core") ? 2
+                                : (sensorName.find("GPU Core") != std::string::npos) ? 1
+                                : 0;
+                        if (pri > g_gpuList[gpuIndex].loadPathPri) {
+                            g_gpuList[gpuIndex].loadPath    = sensorPath;
+                            g_gpuList[gpuIndex].loadPathPri = pri;
                         }
                     }
                     else if (sensorType == "SmallData" || sensorType == "Data") {
