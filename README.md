@@ -1,8 +1,12 @@
-# FPS Overlay - Lightweight Game Performance Monitor
+# FPS Overlay - Lightweight Game Performance Monitor - Anti-cheat safe
 
 A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while gaming — nothing else.
 
 ![Size](https://img.shields.io/badge/size-~9MB-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![License](https://img.shields.io/badge/license-GNU%20GPLv3-green) ![Status](https://img.shields.io/badge/status-beta-orange)
+
+> ⭐ If you like FPS Overlay, please leave a star. It supports the project and keeps it growing. Thank you! ⭐
+
+---
 
 > [!WARNING]
 > **⚠️ Beta Software:** This project is currently in beta and under active development. Features, UI, and behavior are subject to change. Feedback and bug reports are welcome!
@@ -24,9 +28,11 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 
 > [!CAUTION]
 > #### Fullscreen display modes are not supported\*
-> Games require **Borderless**/**Borderless Windowed** mode to be enabled via in-game display settings in order for the fps overlay to show above the game window.
+> Games require **Borderless**/**Borderless Windowed**/**Borderless Fullscreen** mode to be enabled via in-game display settings in order for the FPS Overlay to show above the game window.
 >
-> FPS Overlay will only work in windowed fullscreen mode and windowed borderless fullscreen mode, but will not work in true fullscreen mode. True fullscreen mode on desktop means that other computer applications cannot be displayed over the application that’s in true fullscreen mode.
+> FPS Overlay will only work in **windowed fullscreen mode** and **windowed borderless fullscreen mode**, but will not work in true **fullscreen mode** or **exclusive fullscreen mode**. True **fullscreen mode** and **exclusive fullscreen mode** on desktop means that other computer applications cannot be displayed over the application that’s in **fullscreen mode** and **exclusive fullscreen mode**.
+
+---
 
 ## Features
 
