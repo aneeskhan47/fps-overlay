@@ -3055,22 +3055,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::SetWindowFontScale(1.0f);
             ImGui::SameLine(); ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " %s", APP_VERSION);
 
-            // Show update available notification
-            if (g_updateAvailable) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(.2f,.9f,.4f,1), " -");
-                ImGui::SameLine();
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(.2f,.9f,.4f,1));
-                if (ImGui::SmallButton("Update available!")) {
-                    ShellExecuteA(nullptr, "open", 
-                        "https://github.com/aneeskhan47/fps-overlay/releases/latest",
-                        nullptr, nullptr, SW_SHOWNORMAL);
-                }
-                ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered())
-                    TooltipWrappedFmt("Click to download %s", g_latestVersion);
-            }
-
             const float titleRowBottom = ImGui::GetCursorPosY();
             const float headerButtonsW = CalcHeaderLinkButtonsWidth();
             const float headerButtonsH = CalcHeaderLinkButtonsHeight();
@@ -3078,8 +3062,23 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             DrawHeaderExternalLinkButtonsAt(headerButtonsX, headerY);
 
             const float headerButtonsBottom = headerY + headerButtonsH;
-            const float row1Bottom = titleRowBottom > headerButtonsBottom ? titleRowBottom : headerButtonsBottom;
-            ImGui::SetCursorPosY(row1Bottom + 4.f);
+            float headerNextY = (titleRowBottom > headerButtonsBottom ? titleRowBottom : headerButtonsBottom) + 4.f;
+
+            if (g_updateAvailable) {
+                ImGui::SetCursorPosY(headerNextY);
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(.2f,.9f,.4f,1));
+                if (ImGui::SmallButton("Update available!")) {
+                    ShellExecuteA(nullptr, "open",
+                        "https://github.com/aneeskhan47/fps-overlay/releases/latest",
+                        nullptr, nullptr, SW_SHOWNORMAL);
+                }
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                    TooltipWrappedFmt("Click to download %s", g_latestVersion);
+                headerNextY = ImGui::GetItemRectMax().y + 4.f;
+            }
+
+            ImGui::SetCursorPosY(headerNextY);
             DrawDeveloperAttributionLine();
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetStyle().ItemSpacing.y);
 
