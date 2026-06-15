@@ -147,6 +147,10 @@ struct OverlayConfig {
     float customY = -1.0f;
     int  selectedGpu = 0;     // selected GPU index (0 = first GPU)
     int  overlayScale = 100;  // 50..200 % UI scale for all layouts
+    bool showCpuPower = false;
+    bool showGpuPower = false;
+    bool showCpuFan = false;
+    bool showGpuFan = false;
     bool showCpuFreq = false;
     bool showGpuCoreFreq = false;
     char cpuFreqPath[FREQ_PATH_MAX] = "";
@@ -166,6 +170,8 @@ struct GpuInfo {
     std::string vramUsedPath;  // LHWM sensor path for VRAM used
     std::string vramTotalPath; // LHWM sensor path for VRAM total
     int         vramTotalPri = -1; // higher = better match (see VramTotalSensorPriority)
+    std::string powerPath;         // LHWM sensor path for GPU power (Watts)
+    std::string fanPath;           // LHWM sensor path for GPU fan speed (RPM)
     std::vector<std::pair<std::string, std::string>> coreClockOpts; // display name, path
 };
 static GpuInfo g_gpuList[MAX_GPUS];
@@ -329,6 +335,10 @@ static void LoadConfig(OverlayConfig& cfg)
     cfg.showRAM       = ReadIniInt("Display", "showRAM", 1) != 0;
     cfg.showProcessName = ReadIniInt("Display", "showProcessName", 1) != 0;
 
+    cfg.showCpuPower    = ReadIniInt("Display", "showCpuPower", 0) != 0;
+    cfg.showGpuPower    = ReadIniInt("Display", "showGpuPower", 0) != 0;
+    cfg.showCpuFan      = ReadIniInt("Display", "showCpuFan", 0) != 0;
+    cfg.showGpuFan      = ReadIniInt("Display", "showGpuFan", 0) != 0;
     cfg.showCpuFreq     = ReadIniInt("Frequency", "showCpuFreq", 0) != 0;
     cfg.showGpuCoreFreq = ReadIniInt("Frequency", "showGpuCoreFreq", 0) != 0;
     ReadIniStr("Frequency", "cpuFreqPath", cfg.cpuFreqPath, sizeof(cfg.cpuFreqPath));
@@ -449,6 +459,10 @@ static void SaveConfig(const OverlayConfig& cfg)
     WriteIniInt("Display", "showVRAM", cfg.showVRAM ? 1 : 0);
     WriteIniInt("Display", "showRAM", cfg.showRAM ? 1 : 0);
     WriteIniInt("Display", "showProcessName", cfg.showProcessName ? 1 : 0);
+    WriteIniInt("Display", "showCpuPower", cfg.showCpuPower ? 1 : 0);
+    WriteIniInt("Display", "showGpuPower", cfg.showGpuPower ? 1 : 0);
+    WriteIniInt("Display", "showCpuFan", cfg.showCpuFan ? 1 : 0);
+    WriteIniInt("Display", "showGpuFan", cfg.showGpuFan ? 1 : 0);
 
     WriteIniInt("Frequency", "showCpuFreq", cfg.showCpuFreq ? 1 : 0);
     WriteIniInt("Frequency", "showGpuCoreFreq", cfg.showGpuCoreFreq ? 1 : 0);
@@ -617,7 +631,15 @@ static std::string g_lhwmGpuTempPath;      // e.g., "/gpu-nvidia/0/temperature/0
 static std::string g_lhwmGpuLoadPath;      // e.g., "/gpu-nvidia/0/load/0"
 static std::string g_lhwmGpuVramUsedPath;  // VRAM used
 static std::string g_lhwmGpuVramTotalPath; // VRAM total
+static std::string g_lhwmCpuPowerPath;     // CPU package power sensor
+static std::string g_lhwmGpuPowerPath;     // Active GPU power sensor
+static std::string g_lhwmCpuFanPath;       // CPU fan sensor (from any hardware node)
+static std::string g_lhwmGpuFanPath;       // Active GPU fan sensor
 static float g_lhwmCpuTemp = 0.0f;         // CPU temp from LHWM (used directly)
+static float g_cpuPower = 0.0f;            // CPU power draw in Watts
+static float g_gpuPower = 0.0f;            // GPU power draw in Watts
+static float g_cpuFanRpm = 0.0f;           // CPU fan speed in RPM
+static float g_gpuFanRpm = 0.0f;           // GPU fan speed in RPM
 
 // CPU / GPU core clock options and live values (MHz) + sparkline history
 static std::vector<std::pair<std::string, std::string>> g_cpuClockOpts;
@@ -1884,6 +1906,8 @@ static bool InitLHWM()
                     g_gpuList[gpuIndex].vramUsedPath.clear();
                     g_gpuList[gpuIndex].vramTotalPath.clear();
                     g_gpuList[gpuIndex].vramTotalPri = -1;
+                    g_gpuList[gpuIndex].powerPath.clear();
+                    g_gpuList[gpuIndex].fanPath.clear();
                     g_gpuCount++;
                 }
             }
@@ -1899,6 +1923,24 @@ static bool InitLHWM()
                                   sensorPath.find("/gpu-amd/") != std::string::npos ||
                                   sensorPath.find("/gpu-intel/") != std::string::npos);
                 
+                // CPU fan — search all non-GPU hardware for a fan sensor named "CPU"
+                if (sensorType == "Fan" && !isGpuPath && g_lhwmCpuFanPath.empty()) {
+                    std::string nl;
+                    nl.reserve(sensorName.size());
+                    for (char c : sensorName) nl += (char)tolower((unsigned char)c);
+                    if (nl.find("cpu") != std::string::npos)
+                        g_lhwmCpuFanPath = sensorPath;
+                }
+
+                // CPU power sensors
+                if ((isCpuHardware || isCpuPath) && !isGpuPath && sensorType == "Power") {
+                    if (sensorName.find("Package") != std::string::npos) {
+                        g_lhwmCpuPowerPath = sensorPath;
+                    } else if (g_lhwmCpuPowerPath.empty()) {
+                        g_lhwmCpuPowerPath = sensorPath;
+                    }
+                }
+
                 // CPU temperature sensors
                 if ((isCpuHardware || isCpuPath) && sensorType == "Temperature") {
                     // Priority order for CPU temp (matching Task Manager):
@@ -1969,6 +2011,19 @@ static bool InitLHWM()
                         if (!dup)
                             g_gpuList[gpuIndex].coreClockOpts.push_back({ sensorName, sensorPath });
                     }
+                    else if (sensorType == "Power") {
+                        // Prefer Package power; fall back to first available power sensor
+                        if (sensorName.find("Package") != std::string::npos ||
+                            g_gpuList[gpuIndex].powerPath.empty()) {
+                            g_gpuList[gpuIndex].powerPath = sensorPath;
+                        }
+                    }
+                    else if (sensorType == "Fan") {
+                        // Prefer "GPU Fan" (summary); fall back to first fan sensor found
+                        if (sensorName == "GPU Fan" || g_gpuList[gpuIndex].fanPath.empty()) {
+                            g_gpuList[gpuIndex].fanPath = sensorPath;
+                        }
+                    }
                 }
 
                 if (sensorType == "Clock") {
@@ -2000,6 +2055,8 @@ static bool InitLHWM()
             g_lhwmGpuLoadPath = g_gpuList[idx].loadPath;
             g_lhwmGpuVramUsedPath = g_gpuList[idx].vramUsedPath;
             g_lhwmGpuVramTotalPath = g_gpuList[idx].vramTotalPath;
+            g_lhwmGpuPowerPath = g_gpuList[idx].powerPath;
+            g_lhwmGpuFanPath   = g_gpuList[idx].fanPath;
             snprintf(g_gpuName, sizeof(g_gpuName), "%s", g_gpuList[idx].name);
         }
 
@@ -2050,6 +2107,18 @@ static void PollLHWMStats()
         if (!g_lhwmGpuVramTotalPath.empty()) {
             g_vramTotal = LHWM::GetSensorValue(g_lhwmGpuVramTotalPath) / 1024.0f;
         }
+        if (!g_lhwmCpuPowerPath.empty()) {
+            g_cpuPower = LHWM::GetSensorValue(g_lhwmCpuPowerPath);
+        }
+        if (!g_lhwmGpuPowerPath.empty()) {
+            g_gpuPower = LHWM::GetSensorValue(g_lhwmGpuPowerPath);
+        }
+        if (!g_lhwmCpuFanPath.empty()) {
+            g_cpuFanRpm = LHWM::GetSensorValue(g_lhwmCpuFanPath);
+        }
+        if (!g_lhwmGpuFanPath.empty()) {
+            g_gpuFanRpm = LHWM::GetSensorValue(g_lhwmGpuFanPath);
+        }
     }
     catch (...) {
         // Silently ignore polling errors
@@ -2068,7 +2137,9 @@ static void SelectGpu(int index)
     g_lhwmGpuLoadPath = g_gpuList[index].loadPath;
     g_lhwmGpuVramUsedPath = g_gpuList[index].vramUsedPath;
     g_lhwmGpuVramTotalPath = g_gpuList[index].vramTotalPath;
-    
+    g_lhwmGpuPowerPath = g_gpuList[index].powerPath;
+    g_lhwmGpuFanPath   = g_gpuList[index].fanPath;
+
     snprintf(g_gpuName, sizeof(g_gpuName), "%s", g_gpuList[index].name);
 
     ValidateFrequencyPaths();
@@ -2748,11 +2819,51 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             }
             ImGui::Checkbox("  CPU Usage", &g_Config.showCpuUsage);
             ImGui::Checkbox("  CPU Temp", &g_Config.showCpuTemp);
+            ImGui::Checkbox("  CPU Power (W)", &g_Config.showCpuPower);
+            {
+                const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
+                const bool lhwmBad = !g_lhwmAvailable || g_lhwmCpuPowerPath.empty();
+                if (lhwmBusy || lhwmBad) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1),
+                                       lhwmBusy ? "(loading…)" : "(unavailable)");
+                }
+            }
+            ImGui::Checkbox("  CPU Fan (RPM)", &g_Config.showCpuFan);
+            {
+                const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
+                const bool lhwmBad = !g_lhwmAvailable || g_lhwmCpuFanPath.empty();
+                if (lhwmBusy || lhwmBad) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1),
+                                       lhwmBusy ? "(loading…)" : "(unavailable)");
+                }
+            }
             ImGui::Checkbox("  GPU Usage", &g_Config.showGpuUsage);
             ImGui::Checkbox("  GPU Temp", &g_Config.showGpuTemp);
             {
                 const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
                 const bool lhwmBad = !g_lhwmAvailable || g_gpuCount == 0;
+                if (lhwmBusy || lhwmBad) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1),
+                                       lhwmBusy ? "(loading…)" : "(unavailable)");
+                }
+            }
+            ImGui::Checkbox("  GPU Power (W)", &g_Config.showGpuPower);
+            {
+                const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
+                const bool lhwmBad = !g_lhwmAvailable || g_gpuCount == 0 || g_lhwmGpuPowerPath.empty();
+                if (lhwmBusy || lhwmBad) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1),
+                                       lhwmBusy ? "(loading…)" : "(unavailable)");
+                }
+            }
+            ImGui::Checkbox("  GPU Fan (RPM)", &g_Config.showGpuFan);
+            {
+                const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
+                const bool lhwmBad = !g_lhwmAvailable || g_gpuCount == 0 || g_lhwmGpuFanPath.empty();
                 if (lhwmBusy || lhwmBad) {
                     ImGui::SameLine();
                     ImGui::TextColored(lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1),
@@ -3363,8 +3474,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     needSep = true;
                 }
 
-                const bool wantCpuHzSt = g_Config.showCpuFreq && g_Config.cpuFreqPath[0] && g_lhwmAvailable;
-                if (g_Config.showCpuUsage || g_Config.showCpuTemp || wantCpuHzSt) {
+                const bool wantCpuHzSt  = g_Config.showCpuFreq && g_Config.cpuFreqPath[0] && g_lhwmAvailable;
+                const bool wantCpuPwrSt = g_Config.showCpuPower && !g_lhwmCpuPowerPath.empty() && g_lhwmAvailable;
+                const bool wantCpuFanSt = g_Config.showCpuFan && !g_lhwmCpuFanPath.empty() && g_lhwmAvailable;
+                if (g_Config.showCpuUsage || g_Config.showCpuTemp || wantCpuHzSt || wantCpuPwrSt || wantCpuFanSt) {
                     if (needSep) {
                         ImGui::SameLine(0, hs);
                         ImGui::TextColored(sepC, "|");
@@ -3401,11 +3514,29 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         InlineFreqSparkMHz("##st_cpu", g_cpuSpark, g_cpuSparkN, g_cpuClockMHz,
                                            ImVec2(38.f * ss, 11.f * ss), 5.f * ss, ImVec4(.75f, .75f, .78f, 1.f));
                     }
+                    if (wantCpuPwrSt && g_cpuPower > 0.f) {
+                        if (anyCpuSteam) {
+                            ImGui::SameLine(0, hsTight);
+                            ImGui::TextColored(sepC, "|");
+                            ImGui::SameLine(0, hsTight);
+                        }
+                        ImGui::TextColored(ImVec4(.85f, .78f, .55f, 1), "%.0fW", g_cpuPower);
+                    }
+                    if (wantCpuFanSt) {
+                        if (anyCpuSteam) {
+                            ImGui::SameLine(0, hsTight);
+                            ImGui::TextColored(sepC, "|");
+                            ImGui::SameLine(0, hsTight);
+                        }
+                        ImGui::TextColored(ImVec4(.60f, .80f, .90f, 1), "%.0frpm", g_cpuFanRpm);
+                    }
                     needSep = true;
                 }
 
-                const bool wantGpuHzSt = g_Config.showGpuCoreFreq && g_Config.gpuCoreFreqPath[0] && g_lhwmAvailable;
-                if (g_Config.showGpuUsage || g_Config.showGpuTemp || wantGpuHzSt) {
+                const bool wantGpuHzSt  = g_Config.showGpuCoreFreq && g_Config.gpuCoreFreqPath[0] && g_lhwmAvailable;
+                const bool wantGpuPwrSt = g_Config.showGpuPower && !g_lhwmGpuPowerPath.empty() && g_lhwmAvailable;
+                const bool wantGpuFanSt = g_Config.showGpuFan && !g_lhwmGpuFanPath.empty() && g_lhwmAvailable;
+                if (g_Config.showGpuUsage || g_Config.showGpuTemp || wantGpuHzSt || wantGpuPwrSt || wantGpuFanSt) {
                     if (needSep) {
                         ImGui::SameLine(0, hs);
                         ImGui::TextColored(sepC, "|");
@@ -3445,6 +3576,22 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                             }
                             InlineFreqSparkMHz("##st_gpu", g_gpuSpark, g_gpuSparkN, g_gpuCoreClockMHz,
                                                ImVec2(38.f * ss, 11.f * ss), 5.f * ss, ImVec4(.75f, .75f, .78f, 1.f));
+                        }
+                        if (wantGpuPwrSt && g_gpuPower > 0.f) {
+                            if (anyGpuSteam) {
+                                ImGui::SameLine(0, hsTight);
+                                ImGui::TextColored(sepC, "|");
+                                ImGui::SameLine(0, hsTight);
+                            }
+                            ImGui::TextColored(ImVec4(.85f, .78f, .55f, 1), "%.0fW", g_gpuPower);
+                        }
+                        if (wantGpuFanSt) {
+                            if (anyGpuSteam) {
+                                ImGui::SameLine(0, hsTight);
+                                ImGui::TextColored(sepC, "|");
+                                ImGui::SameLine(0, hsTight);
+                            }
+                            ImGui::TextColored(ImVec4(.60f, .80f, .90f, 1), "%.0frpm", g_gpuFanRpm);
                         }
                     } else {
                         ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1.f), "N/A");
@@ -3503,12 +3650,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     }
                     needSep = true;
                 }
-                
+
                 // CPU
                 {
                     const bool wantCpuHzHz =
                         g_Config.showCpuFreq && g_Config.cpuFreqPath[0] && g_lhwmAvailable;
-                    if (g_Config.showCpuUsage || g_Config.showCpuTemp || wantCpuHzHz) {
+                    const bool wantCpuPwrHz =
+                        g_Config.showCpuPower && !g_lhwmCpuPowerPath.empty() && g_lhwmAvailable;
+                    const bool wantCpuFanHz =
+                        g_Config.showCpuFan && !g_lhwmCpuFanPath.empty() && g_lhwmAvailable;
+                    if (g_Config.showCpuUsage || g_Config.showCpuTemp || wantCpuHzHz || wantCpuPwrHz || wantCpuFanHz) {
                         if (needSep) {
                             ImGui::SameLine();
                             ImGui::TextColored(ImVec4(.35f, .35f, .40f, 1), " | ");
@@ -3517,7 +3668,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         const bool hasCpuTempVal = g_cpuTempAvailable && g_cpuTemp > 0;
                         if (g_Config.showCpuUsage)
                             ImGui::TextColored(ColorByLoad(cpuUsage), "CPU %.0f%%", cpuUsage);
-                        else if (g_Config.showCpuTemp || wantCpuHzHz)
+                        else if (g_Config.showCpuTemp || wantCpuHzHz || wantCpuPwrHz || wantCpuFanHz)
                             ImGui::TextColored(ImVec4(.78f, .78f, .82f, 1), "CPU");
 
                         if (g_Config.showCpuTemp && hasCpuTempVal) {
@@ -3542,6 +3693,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                                                ImVec2(52.f * ovSc, 12.f * ovSc), 6.f * ovSc,
                                                ImVec4(.62f, .62f, .68f, 1.f));
                         }
+                        if (wantCpuPwrHz && g_cpuPower > 0.f) {
+                            ImGui::SameLine(0, 2);
+                            ImGui::TextColored(ImVec4(.85f, .78f, .55f, 1), " %.0fW", g_cpuPower);
+                        }
+                        if (wantCpuFanHz) {
+                            ImGui::SameLine(0, 2);
+                            ImGui::TextColored(ImVec4(.60f, .80f, .90f, 1), " %.0frpm", g_cpuFanRpm);
+                        }
                         needSep = true;
                     }
                 }
@@ -3550,7 +3709,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 {
                     const bool wantGpuHzHz =
                         g_Config.showGpuCoreFreq && g_Config.gpuCoreFreqPath[0] && g_lhwmAvailable;
-                    if (g_Config.showGpuUsage || g_Config.showGpuTemp || wantGpuHzHz) {
+                    const bool wantGpuPwrHz =
+                        g_Config.showGpuPower && !g_lhwmGpuPowerPath.empty() && g_lhwmAvailable;
+                    const bool wantGpuFanHz =
+                        g_Config.showGpuFan && !g_lhwmGpuFanPath.empty() && g_lhwmAvailable;
+                    if (g_Config.showGpuUsage || g_Config.showGpuTemp || wantGpuHzHz || wantGpuPwrHz || wantGpuFanHz) {
                         if (needSep) {
                             ImGui::SameLine();
                             ImGui::TextColored(ImVec4(.35f, .35f, .40f, 1), " | ");
@@ -3564,7 +3727,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         if (hasGpuData) {
                             if (g_Config.showGpuUsage)
                                 ImGui::TextColored(ColorByLoad(dispGpuLoad), "GPU %.0f%%", dispGpuLoad);
-                            else if (g_Config.showGpuTemp || wantGpuHzHz)
+                            else if (g_Config.showGpuTemp || wantGpuHzHz || wantGpuPwrHz || wantGpuFanHz)
                                 ImGui::TextColored(ImVec4(.78f, .78f, .82f, 1), "GPU");
 
                             if (g_Config.showGpuTemp && dispGpuTemp > 0) {
@@ -3589,13 +3752,21 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                                                    ImVec2(52.f * ovSc, 12.f * ovSc), 6.f * ovSc,
                                                    ImVec4(.62f, .62f, .68f, 1.f));
                             }
+                            if (wantGpuPwrHz && g_gpuPower > 0.f) {
+                                ImGui::SameLine(0, 2);
+                                ImGui::TextColored(ImVec4(.85f, .78f, .55f, 1), " %.0fW", g_gpuPower);
+                            }
+                            if (wantGpuFanHz) {
+                                ImGui::SameLine(0, 2);
+                                ImGui::TextColored(ImVec4(.60f, .80f, .90f, 1), " %.0frpm", g_gpuFanRpm);
+                            }
                         } else {
                             ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1), "GPU N/A");
                         }
                         needSep = true;
                     }
                 }
-                
+
                 // VRAM
                 if (g_Config.showVRAM) {
                     float dispVramUsed = g_vramUsed;
@@ -3659,7 +3830,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 {
                     const bool wantCpuHzV =
                         g_Config.showCpuFreq && g_Config.cpuFreqPath[0] && g_lhwmAvailable;
-                    if (g_Config.showCpuUsage || g_Config.showCpuTemp || wantCpuHzV) {
+                    const bool wantCpuPwrV =
+                        g_Config.showCpuPower && !g_lhwmCpuPowerPath.empty() && g_lhwmAvailable;
+                    const bool wantCpuFanV =
+                        g_Config.showCpuFan && !g_lhwmCpuFanPath.empty() && g_lhwmAvailable;
+                    if (g_Config.showCpuUsage || g_Config.showCpuTemp || wantCpuHzV || wantCpuPwrV || wantCpuFanV) {
                         if (needSep) {
                             ImGui::Spacing();
                             ImGui::Separator();
@@ -3682,6 +3857,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                             ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1), "CPU  ---");
                         }
 
+                        if (wantCpuPwrV && g_cpuPower > 0.f)
+                            ImGui::TextColored(ImVec4(.85f, .78f, .55f, 1), "PWR  %.0f W", g_cpuPower);
+                        if (wantCpuFanV)
+                            ImGui::TextColored(ImVec4(.60f, .80f, .90f, 1), "FAN  %.0f RPM", g_cpuFanRpm);
                         ImGui::SetWindowFontScale(0.82f * ovSc);
                         ImGui::TextColored(ImVec4(.42f, .42f, .48f, 1), "  %s", g_cpuName);
                         ImGui::SetWindowFontScale(ovSc);
@@ -3700,8 +3879,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 {
                     const bool wantGpuHzV =
                         g_Config.showGpuCoreFreq && g_Config.gpuCoreFreqPath[0] && g_lhwmAvailable;
+                    const bool wantGpuPwrV =
+                        g_Config.showGpuPower && !g_lhwmGpuPowerPath.empty() && g_lhwmAvailable;
+                    const bool wantGpuFanV =
+                        g_Config.showGpuFan && !g_lhwmGpuFanPath.empty() && g_lhwmAvailable;
                     const bool gpuVertBlock = g_Config.showGpuUsage || g_Config.showGpuTemp || wantGpuHzV ||
-                                              (g_Config.showVRAM && g_lhwmAvailable && g_gpuCount > 0);
+                                              (g_Config.showVRAM && g_lhwmAvailable && g_gpuCount > 0) ||
+                                              wantGpuPwrV || wantGpuFanV;
                     if (gpuVertBlock) {
                         if (needSep) {
                             ImGui::Spacing();
@@ -3739,6 +3923,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                                 ImGui::TextColored(ImVec4(.70f, .70f, .75f, 1), " %.1f / %.0f GB", dispVramUsed,
                                                    dispVramTotal);
                             }
+                            if (wantGpuPwrV && g_gpuPower > 0.f)
+                                ImGui::TextColored(ImVec4(.85f, .78f, .55f, 1), "PWR  %.0f W", g_gpuPower);
+                            if (wantGpuFanV)
+                                ImGui::TextColored(ImVec4(.60f, .80f, .90f, 1), "FAN  %.0f RPM", g_gpuFanRpm);
                         } else {
                             ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1), "GPU  N/A");
                         }
