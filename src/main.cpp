@@ -22,6 +22,7 @@
 #include <wbemidl.h>
 #include <comdef.h>
 #include <winhttp.h>
+#include <wincodec.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdarg>
@@ -39,6 +40,7 @@
 #include <utility>
 
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
 // Note: Link with -lwbemuuid -lole32 -loleaut32 for WMI support
 // Note: Link with lhwm-cpp-wrapper.lib and mscoree.lib for LibreHardwareMonitor support
@@ -62,14 +64,16 @@
 #define IDM_RESET_POS 1006
 
 // Current version
-#define APP_VERSION "v1.6.0-beta"
+#define APP_VERSION "v1.7.0-beta"
 
 // Settings window: fixed outer width (px), vertical resize minimum outer height
-static const int kConfigDlgOuterW = 420;
+static const int kConfigDlgOuterW = 430;
 static const int kConfigDlgMinOuterH = 520;
 
 // PawnIO installer resource ID (embedded executable)
 #define IDR_PAWNIO_SETUP 101
+#define IDR_GITHUB_ICON  102
+#define IDR_KOFI_ICON    103
 
 #ifndef PROCESS_TRACE_MODE_EVENT_RECORD
 #define PROCESS_TRACE_MODE_EVENT_RECORD 0x10000000
@@ -780,6 +784,114 @@ static ID3D11Device*           g_pd3dDevice        = nullptr;
 static ID3D11DeviceContext*    g_pd3dDeviceContext  = nullptr;
 static IDXGISwapChain*         g_pSwapChain        = nullptr;
 static ID3D11RenderTargetView* g_pRenderTargetView = nullptr;
+
+static ID3D11ShaderResourceView* g_texGitHub = nullptr;
+static ID3D11ShaderResourceView* g_texKofi   = nullptr;
+
+static bool LoadTextureFromMemory(const unsigned char* data, size_t dataSize,
+                                  ID3D11ShaderResourceView** outSrv)
+{
+    if (!data || dataSize == 0 || !g_pd3dDevice || !outSrv) return false;
+
+    IWICImagingFactory* factory = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) return false;
+
+    IWICStream* stream = nullptr;
+    hr = factory->CreateStream(&stream);
+    if (FAILED(hr)) { factory->Release(); return false; }
+
+    hr = stream->InitializeFromMemory(const_cast<BYTE*>(data), (DWORD)dataSize);
+    if (FAILED(hr)) { stream->Release(); factory->Release(); return false; }
+
+    IWICBitmapDecoder* decoder = nullptr;
+    hr = factory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnLoad, &decoder);
+    stream->Release();
+    if (FAILED(hr)) { factory->Release(); return false; }
+
+    IWICBitmapFrameDecode* frame = nullptr;
+    hr = decoder->GetFrame(0, &frame);
+    decoder->Release();
+    if (FAILED(hr)) { factory->Release(); return false; }
+
+    IWICFormatConverter* converter = nullptr;
+    hr = factory->CreateFormatConverter(&converter);
+    if (FAILED(hr)) { frame->Release(); factory->Release(); return false; }
+
+    hr = converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone,
+                               nullptr, 0.f, WICBitmapPaletteTypeCustom);
+    frame->Release();
+    if (FAILED(hr)) { converter->Release(); factory->Release(); return false; }
+
+    UINT w = 0, h = 0;
+    converter->GetSize(&w, &h);
+    if (w == 0 || h == 0) {
+        converter->Release();
+        factory->Release();
+        return false;
+    }
+
+    std::vector<BYTE> pixels((size_t)w * (size_t)h * 4);
+    hr = converter->CopyPixels(nullptr, w * 4, (UINT)pixels.size(), pixels.data());
+    converter->Release();
+    factory->Release();
+    if (FAILED(hr)) return false;
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = w;
+    desc.Height = h;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_SUBRESOURCE_DATA sub = {};
+    sub.pSysMem = pixels.data();
+    sub.SysMemPitch = w * 4;
+
+    ID3D11Texture2D* tex = nullptr;
+    hr = g_pd3dDevice->CreateTexture2D(&desc, &sub, &tex);
+    if (FAILED(hr)) return false;
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+
+    hr = g_pd3dDevice->CreateShaderResourceView(tex, &srvDesc, outSrv);
+    tex->Release();
+    return SUCCEEDED(hr);
+}
+
+static bool LoadTextureFromResource(int resId, ID3D11ShaderResourceView** outSrv)
+{
+    if (!g_hInstance || !outSrv) return false;
+    HRSRC res = FindResource(g_hInstance, MAKEINTRESOURCE(resId), RT_RCDATA);
+    if (!res) return false;
+    HGLOBAL mem = LoadResource(g_hInstance, res);
+    if (!mem) return false;
+    DWORD size = SizeofResource(g_hInstance, res);
+    const void* data = LockResource(mem);
+    if (!data || size == 0) return false;
+    return LoadTextureFromMemory(static_cast<const unsigned char*>(data), size, outSrv);
+}
+
+static void InitHeaderIconTextures()
+{
+    if (!g_texGitHub)
+        LoadTextureFromResource(IDR_GITHUB_ICON, &g_texGitHub);
+    if (!g_texKofi)
+        LoadTextureFromResource(IDR_KOFI_ICON, &g_texKofi);
+}
+
+static void ReleaseHeaderIconTextures()
+{
+    if (g_texGitHub) { g_texGitHub->Release(); g_texGitHub = nullptr; }
+    if (g_texKofi)   { g_texKofi->Release();   g_texKofi   = nullptr; }
+}
 
 // ── Hotkey listener state ──
 static int  g_listeningFor = 0;   // 0=none, 1=toggle, 2=exit
@@ -2649,6 +2761,123 @@ static void TooltipWrappedFmt(const char* fmt, ...)
     TooltipWrapped(buf);
 }
 
+static constexpr float kHdrBtnIconSz     = 11.f;
+static constexpr float kHdrBtnPadX       = 6.f;
+static constexpr float kHdrBtnPadY       = 2.f;
+static constexpr float kHdrBtnGapIcon    = 4.f;
+static constexpr float kHdrBtnStackGap   = 3.f;
+static constexpr float kHdrBtnFontScale  = 0.78f;
+
+static float CalcHeaderLinkButtonWidth(const char* label, float iconSz, float padX, float gapAfterIcon)
+{
+    ImGui::SetWindowFontScale(kHdrBtnFontScale);
+    const float w = padX * 2.f + iconSz + gapAfterIcon + ImGui::CalcTextSize(label).x;
+    ImGui::SetWindowFontScale(1.0f);
+    return w;
+}
+
+static float CalcHeaderLinkButtonHeight(float iconSz)
+{
+    ImGui::SetWindowFontScale(kHdrBtnFontScale);
+    const float textH = ImGui::CalcTextSize("Buy me a coffee").y;
+    ImGui::SetWindowFontScale(1.0f);
+    return (iconSz > textH ? iconSz : textH) + kHdrBtnPadY * 2.f;
+}
+
+static bool DrawHeaderLinkButton(const char* id, ImTextureID iconTex, float iconSz,
+                                 const char* label, const char* url, float forcedW = 0.f)
+{
+    const float padX = kHdrBtnPadX;
+    const float padY = kHdrBtnPadY;
+    const float gapAfterIcon = kHdrBtnGapIcon;
+
+    ImGui::SetWindowFontScale(kHdrBtnFontScale);
+    const ImVec2 textSz = ImGui::CalcTextSize(label);
+    ImGui::SetWindowFontScale(1.0f);
+
+    const float btnW = forcedW > 0.f
+        ? forcedW
+        : (padX * 2.f + iconSz + gapAfterIcon + textSz.x);
+    const ImVec2 btnSz(btnW,
+                       (iconSz > textSz.y ? iconSz : textSz.y) + padY * 2.f);
+
+    ImGui::PushID(id);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.f, 0.f));
+    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.13f, 0.14f, 0.17f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.17f, 0.18f, 0.22f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.11f, 0.12f, 0.15f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_Border,        ImVec4(0.22f, 0.24f, 0.28f, 0.35f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.f);
+
+    const bool pressed = ImGui::Button("##btn", btnSz);
+    const ImRect bb(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float midY = (bb.Min.y + bb.Max.y) * 0.5f;
+
+    if (iconTex) {
+        const ImVec2 iconMin(bb.Min.x + padX, midY - iconSz * 0.5f);
+        const ImVec2 iconMax(iconMin.x + iconSz, midY + iconSz * 0.5f);
+        dl->AddImage(iconTex, iconMin, iconMax, ImVec2(0, 0), ImVec2(1, 1),
+                     IM_COL32(170, 175, 185, 255));
+    }
+
+    ImFont* font = ImGui::GetFont();
+    const float scaledSize = ImGui::GetFontSize() * kHdrBtnFontScale;
+    dl->AddText(font, scaledSize,
+                ImVec2(bb.Min.x + padX + iconSz + gapAfterIcon, midY - textSz.y * 0.5f),
+                IM_COL32(165, 170, 180, 255), label);
+
+    if (pressed)
+        ShellExecuteA(nullptr, "open", url, nullptr, nullptr, SW_SHOWNORMAL);
+
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(4);
+    ImGui::PopID();
+    return pressed;
+}
+
+static float CalcHeaderLinkButtonsWidth()
+{
+    const float githubW = CalcHeaderLinkButtonWidth("View on GitHub", kHdrBtnIconSz, kHdrBtnPadX, kHdrBtnGapIcon);
+    const float kofiW   = CalcHeaderLinkButtonWidth("Buy me a coffee", kHdrBtnIconSz, kHdrBtnPadX, kHdrBtnGapIcon);
+    return githubW > kofiW ? githubW : kofiW;
+}
+
+static float CalcHeaderLinkButtonsHeight()
+{
+    return CalcHeaderLinkButtonHeight(kHdrBtnIconSz) * 2.f + kHdrBtnStackGap;
+}
+
+static void DrawHeaderExternalLinkButtonsAt(float x, float y)
+{
+    const float btnW = CalcHeaderLinkButtonsWidth();
+    const float btnH = CalcHeaderLinkButtonHeight(kHdrBtnIconSz);
+
+    ImGui::SetCursorPos(ImVec2(x, y));
+    DrawHeaderLinkButton("github", (ImTextureID)g_texGitHub, kHdrBtnIconSz,
+                         "View on GitHub", "https://github.com/aneeskhan47/fps-overlay", btnW);
+    ImGui::SetCursorPos(ImVec2(x, y + btnH + kHdrBtnStackGap));
+    DrawHeaderLinkButton("kofi", (ImTextureID)g_texKofi, kHdrBtnIconSz,
+                         "Buy me a coffee", "https://ko-fi.com/aneeskhan47", btnW);
+}
+
+static void DrawDeveloperAttributionLine()
+{
+    ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), "Developed by aneeskhan47 & ");
+    ImGui::SameLine(0, 0);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(.55f,.75f,1.f,1));
+    ImGui::Text("contributors");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            ShellExecuteA(nullptr, "open",
+                "https://github.com/aneeskhan47/fps-overlay/graphs/contributors?all=1",
+                nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    ImGui::PopStyleColor();
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // WinMain
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2744,6 +2973,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     ApplyStyle();
     ImGui_ImplWin32_Init(g_hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+    InitHeaderIconTextures();
 
     // ── Timing ──
     using Clock = std::chrono::high_resolution_clock;
@@ -2819,11 +3049,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 ImGuiWindowFlags_NoSavedSettings);
 
             // ── Title ──
+            const float headerY = ImGui::GetCursorPosY();
             ImGui::SetWindowFontScale(1.4f);
             ImGui::TextColored(ImVec4(.35f,.78f,1,1), "FPS Overlay");
             ImGui::SetWindowFontScale(1.0f);
             ImGui::SameLine(); ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " %s", APP_VERSION);
-            
+
             // Show update available notification
             if (g_updateAvailable) {
                 ImGui::SameLine();
@@ -2840,11 +3071,19 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     TooltipWrappedFmt("Click to download %s", g_latestVersion);
             }
 
-            // Developer text
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " Developed by aneeskhan47");
+            const float titleRowBottom = ImGui::GetCursorPosY();
+            const float headerButtonsW = CalcHeaderLinkButtonsWidth();
+            const float headerButtonsH = CalcHeaderLinkButtonsHeight();
+            const float headerButtonsX = ImGui::GetWindowContentRegionMax().x - headerButtonsW;
+            DrawHeaderExternalLinkButtonsAt(headerButtonsX, headerY);
 
-            ImGui::Spacing(); ImGui::Separator();
+            const float headerButtonsBottom = headerY + headerButtonsH;
+            const float row1Bottom = titleRowBottom > headerButtonsBottom ? titleRowBottom : headerButtonsBottom;
+            ImGui::SetCursorPosY(row1Bottom + 4.f);
+            DrawDeveloperAttributionLine();
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetStyle().ItemSpacing.y);
+
+            ImGui::Separator();
 
             // ── DISPLAY ──
             ImGui::Spacing(); ImGui::Spacing();
@@ -4061,6 +4300,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     SaveConfig(g_Config);  // Save settings before exit
     StopEtwSession();
     if (g_Mode == MODE_OVERLAY) RemoveTrayIcon();
+    ReleaseHeaderIconTextures();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
