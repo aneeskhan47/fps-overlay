@@ -37,8 +37,8 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 ## Features
 
 - **FPS** — Real in-game framerate via Windows **ETW** (DirectX 9–12, OpenGL, Vulkan)
-- **CPU** — Usage, temperature, optional **power draw (W)**, optional **fan speed (RPM)**, and optional **clock (MHz)** with a minimal sparkline; pick the LHWM clock sensor in settings
-- **GPU** — Usage, temperature, optional **power draw (W)**, and optional **fan speed (RPM)** (NVIDIA, AMD, Intel via **LibreHardwareMonitor**)
+- **CPU** — Usage, temperature, optional **power draw (W)**, optional **fan speed (RPM)**, and optional **clock (MHz)** with a minimal sparkline; pick the clock sensor in settings
+- **GPU** — Usage, temperature, optional **power draw (W)**, and optional **fan speed (RPM)** (NVIDIA, AMD, Intel)
 - **GPU core clock** — Optional **core frequency (MHz)** with a minimal sparkline; pick the clock sensor for the **selected GPU**
 - **Multi-GPU** — Detect all discrete GPUs and choose which one to monitor
 - **VRAM** — Memory usage (percent and used / total GB)
