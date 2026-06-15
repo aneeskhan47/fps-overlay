@@ -124,6 +124,9 @@ static const char* ETW_SESSION_NAME = "FPSOverlay_ETW";
 #define POS_BOTTOM_CENTER  4
 #define POS_BOTTOM_RIGHT   5
 
+#define TIME_FORMAT_24H    0
+#define TIME_FORMAT_12H    1
+
 #define FREQ_PATH_MAX   260
 #define FREQ_SPARK_LEN  48
 
@@ -136,6 +139,9 @@ struct OverlayConfig {
     bool showVRAM = true;     // GPU VRAM usage
     bool showRAM  = true;
     bool showProcessName = true; // tracked game / process label (all layouts)
+    bool showTime = false;
+    int  timeFormat = TIME_FORMAT_24H; // TIME_FORMAT_24H or TIME_FORMAT_12H
+    bool timeShowSeconds = true;
     int  layoutStyle = LAYOUT_VERTICAL;
     bool useFahrenheit = false; // false = Celsius, true = Fahrenheit
     bool autoStart = false;   // skip config window and start overlay immediately
@@ -185,6 +191,30 @@ inline float ToDisplayTemp(float celsius, bool useFahrenheit) {
 // Temperature thresholds (in Celsius) - adjust for F display comparison
 inline float GetHighTempThreshold(bool useFahrenheit) { return useFahrenheit ? 185.0f : 85.0f; }
 inline float GetMedTempThreshold(bool useFahrenheit) { return useFahrenheit ? 158.0f : 70.0f; }
+
+static void FormatOverlayTime(const OverlayConfig& cfg, char* out, size_t outLen)
+{
+    if (!out || outLen == 0) return;
+    out[0] = '\0';
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    if (cfg.timeFormat == TIME_FORMAT_12H) {
+        int h = (int)st.wHour % 12;
+        if (h == 0) h = 12;
+        const char* ampm = (st.wHour < 12) ? "AM" : "PM";
+        if (cfg.timeShowSeconds)
+            snprintf(out, outLen, "%d:%02u:%02u %s", h, st.wMinute, st.wSecond, ampm);
+        else
+            snprintf(out, outLen, "%d:%02u %s", h, st.wMinute, ampm);
+    } else {
+        if (cfg.timeShowSeconds)
+            snprintf(out, outLen, "%02u:%02u:%02u", st.wHour, st.wMinute, st.wSecond);
+        else
+            snprintf(out, outLen, "%02u:%02u", st.wHour, st.wMinute);
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Configuration file (INI) - saved next to overlay.exe
@@ -334,6 +364,9 @@ static void LoadConfig(OverlayConfig& cfg)
     cfg.showVRAM      = ReadIniInt("Display", "showVRAM", 1) != 0;
     cfg.showRAM       = ReadIniInt("Display", "showRAM", 1) != 0;
     cfg.showProcessName = ReadIniInt("Display", "showProcessName", 1) != 0;
+    cfg.showTime        = ReadIniInt("Display", "showTime", 0) != 0;
+    cfg.timeFormat      = ReadIniInt("Display", "timeFormat", TIME_FORMAT_24H);
+    cfg.timeShowSeconds = ReadIniInt("Display", "timeShowSeconds", 1) != 0;
 
     cfg.showCpuPower    = ReadIniInt("Display", "showCpuPower", 0) != 0;
     cfg.showGpuPower    = ReadIniInt("Display", "showGpuPower", 0) != 0;
@@ -394,6 +427,8 @@ static void LoadConfig(OverlayConfig& cfg)
         cfg.layoutStyle = LAYOUT_VERTICAL;
     if (cfg.overlayScale < 50) cfg.overlayScale = 50;
     if (cfg.overlayScale > 200) cfg.overlayScale = 200;
+    if (cfg.timeFormat != TIME_FORMAT_24H && cfg.timeFormat != TIME_FORMAT_12H)
+        cfg.timeFormat = TIME_FORMAT_24H;
 }
 
 // Check if welcome message has been shown (separate from config)
@@ -459,6 +494,9 @@ static void SaveConfig(const OverlayConfig& cfg)
     WriteIniInt("Display", "showVRAM", cfg.showVRAM ? 1 : 0);
     WriteIniInt("Display", "showRAM", cfg.showRAM ? 1 : 0);
     WriteIniInt("Display", "showProcessName", cfg.showProcessName ? 1 : 0);
+    WriteIniInt("Display", "showTime", cfg.showTime ? 1 : 0);
+    WriteIniInt("Display", "timeFormat", cfg.timeFormat);
+    WriteIniInt("Display", "timeShowSeconds", cfg.timeShowSeconds ? 1 : 0);
     WriteIniInt("Display", "showCpuPower", cfg.showCpuPower ? 1 : 0);
     WriteIniInt("Display", "showGpuPower", cfg.showGpuPower ? 1 : 0);
     WriteIniInt("Display", "showCpuFan", cfg.showCpuFan ? 1 : 0);
@@ -2882,6 +2920,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::Checkbox("  Show process name", &g_Config.showProcessName);
             if (ImGui::IsItemHovered())
                 TooltipWrapped("Tracked game / process label on the overlay (all layouts).");
+            ImGui::Checkbox("  Show Time", &g_Config.showTime);
+            if (ImGui::IsItemHovered())
+                TooltipWrapped("Current local time on the overlay (all layouts).");
+            if (g_Config.showTime) {
+                ImGui::Indent(16.f);
+                const char* timeFormats[] = { "24 Hour", "12 Hour (AM/PM)" };
+                ImGui::SetNextItemWidth(-1);
+                ImGui::Combo("  Time Format", &g_Config.timeFormat, timeFormats, 2);
+                ImGui::Checkbox("  Show Seconds", &g_Config.timeShowSeconds);
+                ImGui::Unindent(16.f);
+            }
 
             // ── GPU SELECTION ──
             if (g_gpuCount > 0) {
@@ -3438,6 +3487,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 const ImVec4 sepC(0.55f, 0.55f, 0.58f, 1.f);
 
                 const bool showProcLine = g_Config.showFPS && g_Config.showProcessName && g_targetProcessName[0];
+                const bool showTimeLine = g_Config.showTime;
+                const bool showMetaLine = showProcLine || showTimeLine;
                 const float lineH = ImGui::GetTextLineHeightWithSpacing();
 
                 ImGui::SetWindowFontScale(1.0f * ss);
@@ -3445,7 +3496,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 // Full-row hit target so CTRL+drag works on labels/values (not only padding)
                 ImVec2 steamRowStart = ImGui::GetCursorPos();
                 if (ctrlHeld) {
-                    float rowH = lineH * (showProcLine ? 2.45f : 1.55f);
+                    float rowH = lineH * (showMetaLine ? 2.45f : 1.55f);
                     float rowW = ImGui::GetContentRegionAvail().x;
                     if (rowW < 32.f)
                         rowW = ImGui::GetWindowWidth() - ImGui::GetCursorPos().x - ImGui::GetStyle().WindowPadding.x;
@@ -3624,9 +3675,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     ImGui::TextColored(ColorByLoad(pct), "RAM %.0f%% %.1f/%.0fG", pct, ramUsed, ramTotal);
                 }
 
-                if (showProcLine) {
+                if (showMetaLine) {
+                    char timeBuf[32] = {};
+                    if (showTimeLine)
+                        FormatOverlayTime(g_Config, timeBuf, sizeof(timeBuf));
                     ImGui::SetWindowFontScale(0.78f * ss);
-                    ImGui::TextColored(ImVec4(.42f, .52f, .42f, 1.f), "%s", g_targetProcessName);
+                    if (showProcLine)
+                        ImGui::TextColored(ImVec4(.42f, .52f, .42f, 1.f), "%s", g_targetProcessName);
+                    if (showTimeLine) {
+                        if (showProcLine) ImGui::SameLine(0, 10.f * ss);
+                        ImGui::TextColored(ImVec4(.55f, .65f, .78f, 1.f), "%s", timeBuf);
+                    }
                 }
 
                 ImGui::SetWindowFontScale(1.0f);
@@ -3786,10 +3845,19 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     ImGui::TextColored(ColorByLoad(pct), "RAM %.0f%% %.1f/%.0fG", pct, ramUsed, ramTotal);
                 }
                 
-                // Process name on second line (compact)
-                if (g_Config.showFPS && g_Config.showProcessName && g_targetProcessName[0]) {
+                // Process name / time on second line (compact)
+                if ((g_Config.showFPS && g_Config.showProcessName && g_targetProcessName[0]) || g_Config.showTime) {
+                    char timeBuf[32] = {};
+                    if (g_Config.showTime)
+                        FormatOverlayTime(g_Config, timeBuf, sizeof(timeBuf));
                     ImGui::SetWindowFontScale(0.78f * ovSc);
-                    ImGui::TextColored(ImVec4(.42f,.52f,.42f,1), "%s", g_targetProcessName);
+                    if (g_Config.showFPS && g_Config.showProcessName && g_targetProcessName[0])
+                        ImGui::TextColored(ImVec4(.42f,.52f,.42f,1), "%s", g_targetProcessName);
+                    if (g_Config.showTime) {
+                        if (g_Config.showFPS && g_Config.showProcessName && g_targetProcessName[0])
+                            ImGui::SameLine(0, 10.f * ovSc);
+                        ImGui::TextColored(ImVec4(.55f,.65f,.78f,1), "%s", timeBuf);
+                    }
                     ImGui::SetWindowFontScale(ovSc);
                 }
                 ImGui::SetWindowFontScale(1.0f);
@@ -3823,6 +3891,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                             ImGui::SetWindowFontScale(ovSc);
                         }
                     }
+                    if (g_Config.showTime) {
+                        char timeBuf[32];
+                        FormatOverlayTime(g_Config, timeBuf, sizeof(timeBuf));
+                        ImGui::SetWindowFontScale(0.82f * ovSc);
+                        ImGui::TextColored(ImVec4(.55f,.65f,.78f,1), "  %s", timeBuf);
+                        ImGui::SetWindowFontScale(ovSc);
+                    }
+                    needSep = true;
+                } else if (g_Config.showTime) {
+                    char timeBuf[32];
+                    FormatOverlayTime(g_Config, timeBuf, sizeof(timeBuf));
+                    ImGui::TextColored(ImVec4(.55f,.65f,.78f,1), "TIME  %s", timeBuf);
                     needSep = true;
                 }
 
