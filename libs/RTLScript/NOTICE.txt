@@ -1,0 +1,12 @@
+# RTLScript (vendored)
+
+Source: https://github.com/oscar7070/RTLScript
+License: MIT (see LICENSE)
+Fork of FarsiType (https://github.com/AmyrAhmady/FarsiType)
+
+Used by fps-overlay to reshape Arabic / Farsi / Urdu / Hebrew text for Dear ImGui
+(which has no built-in RTL / OpenType shaping).
+
+Not used: JimmyLefevre/kb (`kb_text_shape.h`) — full OpenType shaper that outputs
+glyph IDs and requires a custom draw path; incompatible with ImGui::Text* without
+rewriting ImGui text rendering.
