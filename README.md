@@ -2,14 +2,11 @@
 
 A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while gaming — nothing else.
 
-![Size](https://img.shields.io/badge/size-~9MB-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![License](https://img.shields.io/badge/license-GNU%20GPLv3-green) ![Status](https://img.shields.io/badge/status-beta-orange)
+![Size](https://img.shields.io/badge/size-~9MB-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![License](https://img.shields.io/badge/license-GNU%20GPLv3-green) ![Version](https://img.shields.io/badge/version-v1.8.0-blue)
 
 > ⭐ If you like FPS Overlay, please leave a star. It supports the project and keeps it growing. Thank you! ⭐
 
 ---
-
-> [!WARNING]
-> **⚠️ Beta Software:** This project is currently in beta and under active development. Features, UI, and behavior are subject to change. Feedback and bug reports are welcome!
 
 > [!Important]
 > <details>
@@ -52,6 +49,7 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 - **Custom hotkeys** — Toggle visibility and exit (default: **Insert** and **End**)
 - **System tray** — Minimized when running in the background
 - **CTRL + drag / CTRL + right-click menu** — Move the overlay or open hide / settings / exit without affecting other apps
+- **Localization With RTL Support** — Supports 16 languages with RTL support for Arabic, Persian, Urdu, and other RTL languages.
 - **Lightweight** — No installer, no background services, no bloat, ~9 MB portable folder
 
 ## Screenshots
@@ -91,7 +89,7 @@ I wanted a simple FPS overlay. That's it. Just FPS, CPU, GPU, RAM stats on my sc
 
 Grab the latest release from the [Releases](../../releases) page.
 
-Or build it yourself (see below).
+Or build it yourself [(see below)](#building-from-source).
 
 ## Usage
 
@@ -167,6 +165,7 @@ The output is `build\overlay\overlay.exe` along with required DLLs.
 - [Dear ImGui](https://github.com/ocornut/imgui) — Immediate mode GUI
 - [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) — Cross-vendor hardware monitoring
 - [lhwm-cpp-wrapper](https://gitlab.com/OpenRGBDevelopers/lhwm-wrapper) — C++ wrapper for LibreHardwareMonitor
+- [RTLScript](https://github.com/neondigital/RTLScript) — RTLScript library for RTL language support.
 - DirectX 11 SDK (Windows SDK)
 
 ## Project Structure
@@ -200,7 +199,15 @@ fps-overlay/
 - **FPS Tracking:** Windows ETW (Event Tracing for Windows) with D3D9, DXGI, and DxgKrnl providers
 - **CPU Stats:** LibreHardwareMonitor 
 - **GPU Stats:** LibreHardwareMonitor (supports NVIDIA, AMD, Intel)
-- **Windowing:** Win32 API (layered transparent window)
+- **Windowing:** Win32 API (layered transparent window)\
+
+## Credits
+
+- [aneeskhan47](https://github.com/aneeskhan47) - Creator and maintainer
+- [contributors](https://github.com/aneeskhan47/fps-overlay/graphs/contributors) - Contributors
+- [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) - LibreHardwareMonitor library
+- [lhwm-cpp-wrapper](https://gitlab.com/OpenRGBDevelopers/lhwm-wrapper) - C++ wrapper for LibreHardwareMonitor
+- [RTLScript](https://github.com/neondigital/RTLScript) - RTLScript library for RTL language support.
 
 ## Like this project?
 

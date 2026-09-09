@@ -55,6 +55,13 @@ if exist "libs\lhwm\LibreHardwareMonitorLib.dll" (
     echo   - LibreHardwareMonitorLib.dll copied
 )
 
+REM Copy localization packs
+if exist "locales" (
+    if not exist "build\overlay\locales" mkdir "build\overlay\locales"
+    copy /Y "locales\*.json" "build\overlay\locales\" >nul
+    echo   - locales\*.json copied
+)
+
 REM Clean up intermediate files (obj folder)
 echo Cleaning up intermediate files...
 if exist "build\obj" (

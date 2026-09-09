@@ -38,6 +38,8 @@
 #include <vector>
 #include <algorithm>
 #include <utility>
+#include <string>
+#include <map>
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "windowscodecs.lib")
@@ -51,6 +53,8 @@
 #include <tuple>
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
+#include "locale/locale.h"
+#include "locale/rtl_shape.h"
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants & safety defines
@@ -64,11 +68,25 @@
 #define IDM_RESET_POS 1006
 
 // Current version
-#define APP_VERSION "v1.7.0-beta"
+#define APP_VERSION "v1.8.0"
 
 // Settings window: fixed outer width (px), vertical resize minimum outer height
-static const int kConfigDlgOuterW = 430;
-static const int kConfigDlgMinOuterH = 520;
+static const int kConfigDlgOuterW = 680;
+static const int kConfigDlgMinOuterH = 560;
+static const float kSettingsSidebarW = 168.f;
+
+enum SettingsTab {
+    SETTINGS_TAB_DISPLAY = 0,
+    SETTINGS_TAB_GPU,
+    SETTINGS_TAB_FREQUENCY,
+    SETTINGS_TAB_APPEARANCE,
+    SETTINGS_TAB_TEMPERATURE,
+    SETTINGS_TAB_HOTKEYS,
+    SETTINGS_TAB_STARTUP,
+    SETTINGS_TAB_LANGUAGE,
+    SETTINGS_TAB_ABOUT,
+    SETTINGS_TAB_COUNT
+};
 
 // PawnIO installer resource ID (embedded executable)
 #define IDR_PAWNIO_SETUP 101
@@ -150,7 +168,9 @@ struct OverlayConfig {
     bool useFahrenheit = false; // false = Celsius, true = Fahrenheit
     bool autoStart = false;   // skip config window and start overlay immediately
     int  position = POS_TOP_LEFT; // POS_* constants
-    int  opacity  = 85;       // 30..100 % overlay background (all layouts)
+    int  opacity  = 85;       // 0..100 % overlay background (all layouts)
+    int  textOpacity = 100;   // 20..100 % overlay text alpha
+    bool transparentBackground = false; // force background alpha to 0
     int  toggleKey = VK_INSERT;
     int  exitKey   = VK_END;
     float customX = -1.0f;    // custom position (-1 = use corner preset)
@@ -165,6 +185,8 @@ struct OverlayConfig {
     bool showGpuCoreFreq = false;
     char cpuFreqPath[FREQ_PATH_MAX] = "";
     char gpuCoreFreqPath[FREQ_PATH_MAX] = "";
+    char language[32] = "en-US";
+    int  settingsTab = SETTINGS_TAB_DISPLAY;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -207,7 +229,7 @@ static void FormatOverlayTime(const OverlayConfig& cfg, char* out, size_t outLen
     if (cfg.timeFormat == TIME_FORMAT_12H) {
         int h = (int)st.wHour % 12;
         if (h == 0) h = 12;
-        const char* ampm = (st.wHour < 12) ? "AM" : "PM";
+        const char* ampm = (st.wHour < 12) ? locale::T("AM") : locale::T("PM");
         if (cfg.timeShowSeconds)
             snprintf(out, outLen, "%d:%02u:%02u %s", h, st.wMinute, st.wSecond, ampm);
         else
@@ -406,6 +428,8 @@ static void LoadConfig(OverlayConfig& cfg)
         cfg.position = pos;
     }
     cfg.opacity       = ReadIniInt("Layout", "opacity", 85);
+    cfg.textOpacity   = ReadIniInt("Layout", "textOpacity", 100);
+    cfg.transparentBackground = ReadIniInt("Layout", "transparentBackground", 0) != 0;
     cfg.customX       = ReadIniFloat("Layout", "customX", -1.0f);
     cfg.customY       = ReadIniFloat("Layout", "customY", -1.0f);
     {
@@ -414,6 +438,11 @@ static void LoadConfig(OverlayConfig& cfg)
             sc = ReadIniInt("Layout", "steamBarScale", 100);
         cfg.overlayScale = sc;
     }
+
+    ReadIniStr("App", "language", cfg.language, sizeof(cfg.language));
+    if (cfg.language[0] == '\0')
+        snprintf(cfg.language, sizeof(cfg.language), "en-US");
+    cfg.settingsTab = ReadIniInt("App", "settingsTab", SETTINGS_TAB_DISPLAY);
     
     // Hotkeys
     cfg.toggleKey     = ReadIniInt("Hotkeys", "toggleKey", VK_INSERT);
@@ -424,8 +453,10 @@ static void LoadConfig(OverlayConfig& cfg)
     
     // Clamp values to valid ranges
     if (cfg.position < POS_TOP_LEFT || cfg.position > POS_BOTTOM_RIGHT) cfg.position = POS_TOP_LEFT;
-    if (cfg.opacity < 30) cfg.opacity = 30;
+    if (cfg.opacity < 0) cfg.opacity = 0;
     if (cfg.opacity > 100) cfg.opacity = 100;
+    if (cfg.textOpacity < 20) cfg.textOpacity = 20;
+    if (cfg.textOpacity > 100) cfg.textOpacity = 100;
     if (cfg.selectedGpu < 0) cfg.selectedGpu = 0;
     if (cfg.layoutStyle < LAYOUT_VERTICAL || cfg.layoutStyle > LAYOUT_STEAM)
         cfg.layoutStyle = LAYOUT_VERTICAL;
@@ -433,6 +464,8 @@ static void LoadConfig(OverlayConfig& cfg)
     if (cfg.overlayScale > 200) cfg.overlayScale = 200;
     if (cfg.timeFormat != TIME_FORMAT_24H && cfg.timeFormat != TIME_FORMAT_12H)
         cfg.timeFormat = TIME_FORMAT_24H;
+    if (cfg.settingsTab < 0 || cfg.settingsTab >= SETTINGS_TAB_COUNT)
+        cfg.settingsTab = SETTINGS_TAB_DISPLAY;
 }
 
 // Check if welcome message has been shown (separate from config)
@@ -455,18 +488,20 @@ static void ShowWelcomeMessage()
         return;  // Already shown before
     }
     
-    MessageBoxA(
+    MessageBoxW(
         nullptr,
-        "Welcome to FPS Overlay!\n\n"
-        "For the best experience, it is recommended to disable other FPS overlays:\n\n"
-        "  - Steam Overlay (Steam > Settings > In-Game)\n"
-        "  - Xbox Game Bar (Windows Settings > Gaming)\n"
-        "  - NVIDIA GeForce Experience Overlay/NVIDIA ShadowPlay/NVIDIA App\n"
-        "  - AMD Radeon Software Overlay\n"
-        "  - Discord Overlay\n\n"
-        "This prevents conflicts and ensures accurate FPS readings.\n\n"
-        "Enjoy!",
-        "FPS Overlay",
+        locale::ToWide(locale::DialogBody(
+            "welcome",
+            "Welcome to FPS Overlay!\n\n"
+            "For the best experience, it is recommended to disable other FPS overlays:\n\n"
+            "  - Steam Overlay (Steam > Settings > In-Game)\n"
+            "  - Xbox Game Bar (Windows Settings > Gaming)\n"
+            "  - NVIDIA GeForce Experience Overlay/NVIDIA ShadowPlay/NVIDIA App\n"
+            "  - AMD Radeon Software Overlay\n"
+            "  - Discord Overlay\n\n"
+            "This prevents conflicts and ensures accurate FPS readings.\n\n"
+            "Enjoy!")).c_str(),
+        locale::ToWide(locale::DialogTitle("welcome", "FPS Overlay")).c_str(),
         MB_OK | MB_ICONINFORMATION | MB_TOPMOST
     );
     
@@ -519,6 +554,8 @@ static void SaveConfig(const OverlayConfig& cfg)
     WriteIniInt("Layout", "position", cfg.position);
     WriteIniInt("Layout", "positionVer", 2);
     WriteIniInt("Layout", "opacity", cfg.opacity);
+    WriteIniInt("Layout", "textOpacity", cfg.textOpacity);
+    WriteIniInt("Layout", "transparentBackground", cfg.transparentBackground ? 1 : 0);
     WriteIniFloat("Layout", "customX", cfg.customX);
     WriteIniFloat("Layout", "customY", cfg.customY);
     WriteIniInt("Layout", "overlayScale", cfg.overlayScale);
@@ -529,6 +566,9 @@ static void SaveConfig(const OverlayConfig& cfg)
     
     // GPU selection
     WriteIniInt("GPU", "selectedGpu", cfg.selectedGpu);
+
+    WriteIniStr("App", "language", cfg.language);
+    WriteIniInt("App", "settingsTab", cfg.settingsTab);
 
     if (pawnioRb != 0) {
         WriteIniInt("App", "PawnIORequiresReboot", 1);
@@ -548,6 +588,139 @@ static AppMode       g_Mode       = MODE_CONFIG;
 static PendingCmd    g_Pending    = CMD_NONE;
 static bool          g_Running    = true;
 static bool          g_OvlVisible = true;
+
+// Overlay text color with configurable text opacity.
+static ImVec4 OvCol(float r, float g, float b, float a = 1.f)
+{
+    const float ta = (g_Config.textOpacity / 100.f) * a;
+    return ImVec4(r, g, b, ta);
+}
+
+static ImVec4 OvColV(const ImVec4& c)
+{
+    return OvCol(c.x, c.y, c.z, c.w);
+}
+
+static void AppendMenuUtf8(HMENU m, UINT flags, UINT_PTR id, const char* utf8)
+{
+    const std::wstring w = locale::ToWide(utf8);
+    AppendMenuW(m, flags, id, w.c_str());
+}
+
+static float OverlayBgAlpha(bool ctrlHeld)
+{
+    if (g_Config.transparentBackground)
+        return ctrlHeld ? 0.35f : 0.f;
+    const float a = g_Config.opacity / 100.f;
+    return ctrlHeld ? (a < 0.55f ? 0.55f : a) : a;
+}
+
+static bool g_fontsNeedReload = false;
+
+static void LoadAppFonts()
+{
+    ImGuiIO& io = ImGui::GetIO();
+    io.Fonts->Clear();
+
+    ImFontGlyphRangesBuilder glyphBuilder;
+    glyphBuilder.AddRanges(io.Fonts->GetGlyphRangesDefault());
+    glyphBuilder.AddChar((ImWchar)0x2122);
+    glyphBuilder.AddChar((ImWchar)0x00A9);
+    glyphBuilder.AddChar((ImWchar)0x00AE);
+    // Latin Extended-A (Polish, Turkish, French œ, etc.) — small, always include.
+    {
+        static const ImWchar kLatinExtA[] = { 0x0100, 0x017F, 0 };
+        glyphBuilder.AddRanges(kLatinExtA);
+    }
+    const bool wantCjkZh = (_strnicmp(g_Config.language, "zh", 2) == 0);
+    const bool wantCjkJa = (_strnicmp(g_Config.language, "ja", 2) == 0);
+    const bool wantCjkKo = (_strnicmp(g_Config.language, "ko", 2) == 0);
+    const bool wantCyrillic =
+        (_strnicmp(g_Config.language, "ru", 2) == 0) ||
+        (_strnicmp(g_Config.language, "uk", 2) == 0) ||
+        (_strnicmp(g_Config.language, "bg", 2) == 0);
+    const bool wantRtlScript =
+        (_strnicmp(g_Config.language, "ar", 2) == 0) ||
+        (_strnicmp(g_Config.language, "fa", 2) == 0) ||
+        (_strnicmp(g_Config.language, "ur", 2) == 0) ||
+        (_strnicmp(g_Config.language, "he", 2) == 0) ||
+        (_strnicmp(g_Config.language, "iw", 2) == 0); // old Hebrew code
+    if (wantCjkZh)
+        glyphBuilder.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+    if (wantCjkJa)
+        glyphBuilder.AddRanges(io.Fonts->GetGlyphRangesJapanese());
+    if (wantCjkKo)
+        glyphBuilder.AddRanges(io.Fonts->GetGlyphRangesKorean());
+    if (wantCyrillic)
+        glyphBuilder.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
+    if (wantRtlScript) {
+        // Arabic / Farsi / Urdu + presentation forms; Hebrew block for he.
+        static const ImWchar kRtlRanges[] = {
+            0x0590, 0x05FF, // Hebrew
+            0x0600, 0x06FF, // Arabic
+            0x0750, 0x077F, // Arabic Supplement
+            0x08A0, 0x08FF, // Arabic Extended-A
+            0xFB1D, 0xFB4F, // Hebrew presentation forms
+            0xFB50, 0xFDFF, // Arabic Presentation Forms-A
+            0xFE70, 0xFEFF, // Arabic Presentation Forms-B
+            0
+        };
+        glyphBuilder.AddRanges(kRtlRanges);
+    }
+
+    static ImVector<ImWchar> s_imguiGlyphRanges;
+    s_imguiGlyphRanges.clear();
+    glyphBuilder.BuildRanges(&s_imguiGlyphRanges);
+
+    ImFont* font = nullptr;
+    if (wantCjkZh) {
+        font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", 17.0f, nullptr,
+                                           s_imguiGlyphRanges.Data);
+        if (!font)
+            font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttf", 17.0f, nullptr,
+                                               s_imguiGlyphRanges.Data);
+        if (!font)
+            font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\simhei.ttf", 17.0f, nullptr,
+                                               s_imguiGlyphRanges.Data);
+    } else if (wantCjkJa) {
+        font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msgothic.ttc", 17.0f, nullptr,
+                                           s_imguiGlyphRanges.Data);
+        if (!font)
+            font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\YuGothM.ttc", 17.0f, nullptr,
+                                               s_imguiGlyphRanges.Data);
+        if (!font)
+            font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\meiryo.ttc", 17.0f, nullptr,
+                                               s_imguiGlyphRanges.Data);
+    } else if (wantCjkKo) {
+        font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\malgun.ttf", 17.0f, nullptr,
+                                           s_imguiGlyphRanges.Data);
+    }
+    // Segoe UI covers Latin + Arabic/Hebrew; prefer it for RTL scripts and as default/fallback.
+    if (!font)
+        font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 17.0f, nullptr,
+                                            s_imguiGlyphRanges.Data);
+    if (!font && wantRtlScript) {
+        font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\arial.ttf", 17.0f, nullptr,
+                                            s_imguiGlyphRanges.Data);
+        if (!font)
+            font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\tahoma.ttf", 17.0f, nullptr,
+                                               s_imguiGlyphRanges.Data);
+    }
+    if (!font) {
+        ImFontConfig fc;
+        fc.SizePixels = 16;
+        io.Fonts->AddFontDefault(&fc);
+    }
+}
+
+static void ApplyLanguage(const char* lang)
+{
+    if (!lang || !lang[0]) lang = "en-US";
+    snprintf(g_Config.language, sizeof(g_Config.language), "%s", lang);
+    locale::Load(g_Config.language);
+    locale::ApplyImGuiRtlFlags();
+    g_fontsNeedReload = true;
+}
 
 static HINSTANCE      g_hInstance = nullptr;
 static HWND           g_hwnd     = nullptr;
@@ -753,9 +926,9 @@ static void DrawMiniSpark(const char* id, const float* hist, int n, float mhz, I
         ImGui::SameLine();
     }
     if (mhz > 0.f)
-        ImGui::TextColored(ImVec4(.72f, .72f, .76f, 1), "%.0f MHz", mhz);
+        ImGui::TextColored(OvCol(.72f, .72f, .76f, 1), "%s", locale::TF("%.0f MHz", mhz));
     else
-        ImGui::TextColored(ImVec4(.45f, .45f, .50f, 1), "--- MHz");
+        ImGui::TextColored(OvCol(.45f, .45f, .50f, 1), "%s", locale::T("--- MHz"));
 }
 
 // Inline spark + MHz for horizontal / Steam rows: ImGui SameLine top-aligns widgets, so we
@@ -776,7 +949,7 @@ static void InlineFreqSparkMHz(const char* plotId, const float* hist, int n, flo
     ImGui::PopStyleVar();
     ImGui::SameLine(0, gapAfterPlot);
     ImGui::SetCursorPosY(rowTop + (rowH - textH) * 0.5f);
-    ImGui::TextColored(txtCol, "%.0f MHz", mhz);
+    ImGui::TextColored(OvColV(txtCol), "%s", locale::TF("%.0f MHz", mhz));
 }
 
 // ── DX11 ──
@@ -1665,21 +1838,27 @@ static bool AcquireShutdownPrivilege()
 
 // Same restart choice whenever a reboot is required (post-install / gate / WMI / bad marker).
 // MB_SYSTEMMODAL + topmost + foreground so it is not lost behind other windows.
-static void ForceShowPawnIORestartRequiredDialogThenExit(const wchar_t* situationLead)
+static void ForceShowPawnIORestartRequiredDialogThenExit(const char* situationLeadId,
+                                                         const char* situationLeadEn)
 {
     const UINT kMb =
         MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_TOPMOST | MB_SETFOREGROUND | MB_SYSTEMMODAL;
 
-    wchar_t body[2048];
-    _snwprintf_s(body, _TRUNCATE,
-                 L"%s\n\n"
-                 L"Important: save your work in other apps before restarting. Unsaved data may be lost.\n\n"
-                 L"A full system restart is required before FPS Overlay can run.\n\n"
-                 L"Yes \u2014 restart this PC now (FPS Overlay will close first)\n"
-                 L"No \u2014 restart later (FPS Overlay will close; use Start \u2192 Power \u2192 Restart when ready)\n\n",
-                 situationLead ? situationLead : L"");
+    const std::wstring lead = locale::ToWide(locale::DialogBody(situationLeadId, situationLeadEn));
+    const std::wstring tail = locale::ToWide(locale::DialogBody(
+        "restart_required",
+        "Important: save your work in other apps before restarting. Unsaved data may be lost.\n\n"
+        "A full system restart is required before FPS Overlay can run.\n\n"
+        "Yes \xE2\x80\x94 restart this PC now (FPS Overlay will close first)\n"
+        "No \xE2\x80\x94 restart later (FPS Overlay will close; use Start \xE2\x86\x92 Power \xE2\x86\x92 Restart when ready)\n\n"));
 
-    const int r = MessageBoxW(nullptr, body, L"FPS Overlay \u2014 Restart required", kMb);
+    wchar_t body[2048];
+    _snwprintf_s(body, _TRUNCATE, L"%s\n\n%s", lead.c_str(), tail.c_str());
+
+    const int r = MessageBoxW(
+        nullptr, body,
+        locale::ToWide(locale::DialogTitle("restart_required", "FPS Overlay \xE2\x80\x94 Restart required")).c_str(),
+        kMb);
 
     if (r == IDYES) {
         if (AcquireShutdownPrivilege()) {
@@ -1688,10 +1867,12 @@ static void ForceShowPawnIORestartRequiredDialogThenExit(const wchar_t* situatio
                               SHTDN_REASON_FLAG_PLANNED);
         }
         MessageBoxW(nullptr,
-                      L"Could not start an automatic restart. Please restart your PC manually "
-                      L"(Start \u2192 Power \u2192 Restart), then start FPS Overlay again.",
-                      L"FPS Overlay",
-                      MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND | MB_SYSTEMMODAL);
+                    locale::ToWide(locale::DialogBody(
+                        "restart_failed",
+                        "Could not start an automatic restart. Please restart your PC manually "
+                        "(Start \xE2\x86\x92 Power \xE2\x86\x92 Restart), then start FPS Overlay again.")).c_str(),
+                    locale::ToWide(locale::DialogTitle("restart_failed", "FPS Overlay")).c_str(),
+                    MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND | MB_SYSTEMMODAL);
     }
     ExitProcess(0);
 }
@@ -1722,11 +1903,12 @@ static void CheckPawnIORebootGateOrExit()
     FILETIME marker = {};
     if (!ReadPawnIOInstallMarkerFileTime(&marker)) {
         ForceShowPawnIORestartRequiredDialogThenExit(
-            L"FPS Overlay is waiting for a system restart after PawnIO was installed or updated, "
-            L"but the restart marker in config.ini is missing or invalid.\n\n"
-            L"If this persists after restarting Windows, delete PawnIORequiresReboot and "
-            L"PawnIOInstallUtcHex under [App] in config.ini and delete fpsoverlay-pawnio-reboot.state "
-            L"next to overlay.exe.");
+            "restart_marker_invalid",
+            "FPS Overlay is waiting for a system restart after PawnIO was installed or updated, "
+            "but the restart marker in config.ini is missing or invalid.\n\n"
+            "If this persists after restarting Windows, delete PawnIORequiresReboot and "
+            "PawnIOInstallUtcHex under [App] in config.ini and delete fpsoverlay-pawnio-reboot.state "
+            "next to overlay.exe.");
         return;
     }
 
@@ -1746,20 +1928,24 @@ static void CheckPawnIORebootGateOrExit()
 
     if (!haveBootApprox && !haveBootWmi) {
         ForceShowPawnIORestartRequiredDialogThenExit(
-            L"FPS Overlay cannot verify that this PC has restarted since PawnIO was installed or updated "
-            L"(Windows could not report the last boot time). A full restart is still required.");
+            "cannot_verify_boot",
+            "FPS Overlay cannot verify that this PC has restarted since PawnIO was installed or updated "
+            "(Windows could not report the last boot time). A full restart is still required.");
         return;
     }
 
     ForceShowPawnIORestartRequiredDialogThenExit(
-        L"You must restart Windows before using FPS Overlay.\n\n"
-        L"PawnIO was installed or updated earlier, and this session has not completed a full system restart yet.");
+        "must_restart_windows",
+        "You must restart Windows before using FPS Overlay.\n\n"
+        "PawnIO was installed or updated earlier, and this session has not completed a full system restart yet.");
 }
 
 // Called after PawnIO_setup exits 0 and reboot pending is already committed to config.ini.
 static void RequireSystemRestartAfterPawnIOSetup()
 {
-    ForceShowPawnIORestartRequiredDialogThenExit(L"PawnIO was installed or updated successfully.");
+    ForceShowPawnIORestartRequiredDialogThenExit(
+        "pawnio_installed_success",
+        "PawnIO was installed or updated successfully.");
 }
 
 // Extract embedded PawnIO_setup.exe and run it (-install). Success only if the process exits with code 0.
@@ -1827,30 +2013,39 @@ static void EnforcePawnIOOrExit()
         if (!IsPawnIOInstalled()) {
             int r = MessageBoxW(
                 nullptr,
-                L"The PawnIO driver is required for FPS Overlay.\n\n"
-                L"LibreHardwareMonitor uses it for CPU and GPU temperatures. "
-                L"The app cannot continue without it.\n\n"
-                L"Click OK to install PawnIO.\n"
-                L"Click Cancel to exit.",
-                L"FPS Overlay \u2014 PawnIO required",
+                locale::ToWide(locale::DialogBody(
+                    "pawnio_required",
+                    "The PawnIO driver is required for FPS Overlay.\n\n"
+                    "LibreHardwareMonitor uses it for CPU and GPU temperatures. "
+                    "The app cannot continue without it.\n\n"
+                    "Click OK to install PawnIO.\n"
+                    "Click Cancel to exit.")).c_str(),
+                locale::ToWide(locale::DialogTitle(
+                    "pawnio_required", "FPS Overlay \xE2\x80\x94 PawnIO required")).c_str(),
                 MB_OKCANCEL | MB_ICONWARNING | MB_TOPMOST);
             if (r != IDOK)
                 ExitProcess(1);
             if (!ExtractAndRunPawnIOSetup()) {
                 MessageBoxW(nullptr,
-                              L"PawnIO setup did not finish successfully. The installer exited with an error "
-                              L"(for example, an existing PawnIO build must be removed first).\n\n"
-                              L"Uninstall PawnIO from Windows Settings \u2192 Apps \u2192 Installed apps, then click OK again here.",
-                              L"FPS Overlay", MB_OK | MB_ICONERROR | MB_TOPMOST);
+                    locale::ToWide(locale::DialogBody(
+                        "pawnio_install_failed",
+                        "PawnIO setup did not finish successfully. The installer exited with an error "
+                        "(for example, an existing PawnIO build must be removed first).\n\n"
+                        "Uninstall PawnIO from Windows Settings \xE2\x86\x92 Apps \xE2\x86\x92 Installed apps, "
+                        "then click OK again here.")).c_str(),
+                    locale::ToWide(locale::DialogTitle("pawnio_install_failed", "FPS Overlay")).c_str(),
+                    MB_OK | MB_ICONERROR | MB_TOPMOST);
                 continue;
             }
             if (!CommitPawnIORebootPendingToIni()) {
                 MessageBoxW(nullptr,
-                              L"FPS Overlay could not save the restart requirement (config.ini or "
-                              L"fpsoverlay-pawnio-reboot.state next to overlay.exe). Check the folder is writable, "
-                              L"then try installing PawnIO again.",
-                              L"FPS Overlay",
-                              MB_OK | MB_ICONERROR | MB_TOPMOST);
+                    locale::ToWide(locale::DialogBody(
+                        "pawnio_save_restart_failed_install",
+                        "FPS Overlay could not save the restart requirement (config.ini or "
+                        "fpsoverlay-pawnio-reboot.state next to overlay.exe). Check the folder is writable, "
+                        "then try installing PawnIO again.")).c_str(),
+                    locale::ToWide(locale::DialogTitle("pawnio_save_restart_failed_install", "FPS Overlay")).c_str(),
+                    MB_OK | MB_ICONERROR | MB_TOPMOST);
                 ExitProcess(1);
             }
             RequireSystemRestartAfterPawnIOSetup();
@@ -1859,30 +2054,39 @@ static void EnforcePawnIOOrExit()
         if (IsPawnIOOutdatedVsBundled()) {
             int r = MessageBoxW(
                 nullptr,
-                L"Your PawnIO driver is older than the version bundled with FPS Overlay.\n\n"
-                L"An outdated PawnIO can break LibreHardwareMonitor (missing or wrong temperatures). "
-                L"You must update to continue.\n\n"
-                L"Click OK to update now (replaces the existing install).\n"
-                L"Click Cancel to exit.",
-                L"FPS Overlay \u2014 PawnIO update required",
+                locale::ToWide(locale::DialogBody(
+                    "pawnio_outdated",
+                    "Your PawnIO driver is older than the version bundled with FPS Overlay.\n\n"
+                    "An outdated PawnIO can break LibreHardwareMonitor (missing or wrong temperatures). "
+                    "You must update to continue.\n\n"
+                    "Click OK to update now (replaces the existing install).\n"
+                    "Click Cancel to exit.")).c_str(),
+                locale::ToWide(locale::DialogTitle(
+                    "pawnio_outdated", "FPS Overlay \xE2\x80\x94 PawnIO update required")).c_str(),
                 MB_OKCANCEL | MB_ICONWARNING | MB_TOPMOST);
             if (r != IDOK)
                 ExitProcess(1);
             if (!ExtractAndRunPawnIOSetup()) {
                 MessageBoxW(nullptr,
-                              L"PawnIO update did not finish successfully. The installer exited with an error "
-                              L"(for example, the old version must be removed before installing again).\n\n"
-                              L"Uninstall PawnIO from Windows Settings \u2192 Apps \u2192 Installed apps, then click OK again here.",
-                              L"FPS Overlay", MB_OK | MB_ICONERROR | MB_TOPMOST);
+                    locale::ToWide(locale::DialogBody(
+                        "pawnio_update_failed",
+                        "PawnIO update did not finish successfully. The installer exited with an error "
+                        "(for example, the old version must be removed before installing again).\n\n"
+                        "Uninstall PawnIO from Windows Settings \xE2\x86\x92 Apps \xE2\x86\x92 Installed apps, "
+                        "then click OK again here.")).c_str(),
+                    locale::ToWide(locale::DialogTitle("pawnio_update_failed", "FPS Overlay")).c_str(),
+                    MB_OK | MB_ICONERROR | MB_TOPMOST);
                 continue;
             }
             if (!CommitPawnIORebootPendingToIni()) {
                 MessageBoxW(nullptr,
-                              L"FPS Overlay could not save the restart requirement (config.ini or "
-                              L"fpsoverlay-pawnio-reboot.state next to overlay.exe). Check the folder is writable, "
-                              L"then try updating PawnIO again.",
-                              L"FPS Overlay",
-                              MB_OK | MB_ICONERROR | MB_TOPMOST);
+                    locale::ToWide(locale::DialogBody(
+                        "pawnio_save_restart_failed_update",
+                        "FPS Overlay could not save the restart requirement (config.ini or "
+                        "fpsoverlay-pawnio-reboot.state next to overlay.exe). Check the folder is writable, "
+                        "then try updating PawnIO again.")).c_str(),
+                    locale::ToWide(locale::DialogTitle("pawnio_save_restart_failed_update", "FPS Overlay")).c_str(),
+                    MB_OK | MB_ICONERROR | MB_TOPMOST);
                 ExitProcess(1);
             }
             RequireSystemRestartAfterPawnIOSetup();
@@ -2550,7 +2754,7 @@ void AddTrayIcon()
     g_nid.hIcon            = LoadIcon(g_hInstance, MAKEINTRESOURCE(1));
     if (!g_nid.hIcon)
         g_nid.hIcon        = LoadIcon(nullptr, IDI_APPLICATION);
-    lstrcpy(g_nid.szTip, "FPS Overlay");
+    lstrcpy(g_nid.szTip, locale::T("FPS Overlay"));
     Shell_NotifyIcon(NIM_ADD, &g_nid);
 }
 
@@ -2559,9 +2763,10 @@ void RemoveTrayIcon() { Shell_NotifyIcon(NIM_DELETE, &g_nid); }
 void UpdateTrayTooltip()
 {
     if (g_updateAvailable) {
-        snprintf(g_nid.szTip, sizeof(g_nid.szTip), "FPS Overlay - Update available! (%s)", g_latestVersion);
+        snprintf(g_nid.szTip, sizeof(g_nid.szTip), "%s",
+                 locale::TF("FPS Overlay - Update available! (%s)", g_latestVersion));
     } else {
-        lstrcpy(g_nid.szTip, "FPS Overlay");
+        lstrcpy(g_nid.szTip, locale::T("FPS Overlay"));
     }
     Shell_NotifyIcon(NIM_MODIFY, &g_nid);
 }
@@ -2645,6 +2850,8 @@ void CleanupRenderTarget()
 // ═══════════════════════════════════════════════════════════════════════════
 void ShutdownBackends()
 {
+    // Must release app textures before destroying the D3D device (otherwise SRVs dangle).
+    ReleaseHeaderIconTextures();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     CleanupDeviceD3D();
@@ -2655,6 +2862,7 @@ void InitBackends()
     CreateDeviceD3D(g_hwnd);
     ImGui_ImplWin32_Init(g_hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+    InitHeaderIconTextures();
 }
 
 // Toggle click-through mode on the overlay window
@@ -2761,6 +2969,122 @@ static void TooltipWrappedFmt(const char* fmt, ...)
     TooltipWrapped(buf);
 }
 
+// ── RTL layout helpers (Dear ImGui has no built-in RTL; mirror manually) ──
+static void RtlAlignNext(float itemWidth)
+{
+    if (!locale::IsRtl()) return;
+    const float avail = ImGui::GetContentRegionAvail().x;
+    if (avail > itemWidth)
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - itemWidth));
+}
+
+static void RtlSectionTitle(const char* text)
+{
+    const ImVec4 col(.55f, .70f, .95f, 1.f);
+    if (locale::IsRtl())
+        RtlAlignNext(ImGui::CalcTextSize(text).x);
+    ImGui::TextColored(col, "%s", text);
+}
+
+static void RtlMutedText(const char* text)
+{
+    if (locale::IsRtl())
+        RtlAlignNext(ImGui::CalcTextSize(text).x);
+    ImGui::TextColored(ImVec4(.45f, .45f, .50f, 1), "%s", text);
+}
+
+// ImGui RadioButton always puts the circle on the left; for RTL put label then circle on the right.
+// Dear ImGui has no RTL layout — only right-align when starting a new line (not mid-SameLine).
+static bool RtlRadioButton(const char* label, int* v, int v_button)
+{
+    if (!locale::IsRtl())
+        return ImGui::RadioButton(label, v, v_button);
+
+    ImGui::PushID(label);
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float radioSz = ImGui::GetFrameHeight();
+    const ImVec2 labelSz = ImGui::CalcTextSize(label, nullptr, true);
+    const float total = labelSz.x + st.ItemInnerSpacing.x + radioSz;
+    const float lineStartX = ImGui::GetWindowContentRegionMin().x;
+    if (ImGui::GetCursorPosX() <= lineStartX + 1.0f)
+        RtlAlignNext(total);
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine(0, st.ItemInnerSpacing.x);
+    bool pressed = ImGui::RadioButton("##rb", *v == v_button);
+    if (pressed)
+        *v = v_button;
+    ImGui::PopID();
+    return pressed;
+}
+
+static bool RtlCheckbox(const char* label, bool* v)
+{
+    if (!locale::IsRtl())
+        return ImGui::Checkbox(label, v);
+
+    ImGui::PushID(label);
+    ImGui::PushTextWrapPos(-1.0f);
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float boxSz = ImGui::GetFrameHeight();
+    const ImVec2 labelSz = ImGui::CalcTextSize(label, nullptr, true);
+    const float total = labelSz.x + st.ItemInnerSpacing.x + boxSz;
+    const float lineStartX = ImGui::GetWindowContentRegionMin().x;
+    if (ImGui::GetCursorPosX() <= lineStartX + 1.0f)
+        RtlAlignNext(total);
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine(0, st.ItemInnerSpacing.x);
+    bool pressed = ImGui::Checkbox("##cb", v);
+    ImGui::PopTextWrapPos();
+    ImGui::PopID();
+    return pressed;
+}
+
+// Pack optional trailing hint with the checkbox so SameLine cannot stretch across the pane.
+static bool RtlCheckboxHint(const char* label, bool* v, const char* hint, const ImVec4& hintCol)
+{
+    if (!hint || !hint[0])
+        return RtlCheckbox(label, v);
+
+    if (!locale::IsRtl()) {
+        const bool pressed = ImGui::Checkbox(label, v);
+        ImGui::SameLine();
+        ImGui::TextColored(hintCol, "%s", hint);
+        return pressed;
+    }
+
+    ImGui::PushID(label);
+    ImGui::PushTextWrapPos(-1.0f);
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float boxSz = ImGui::GetFrameHeight();
+    const float labelW = ImGui::CalcTextSize(label, nullptr, true).x;
+    const float hintW = ImGui::CalcTextSize(hint).x;
+    const float gap = st.ItemSpacing.x;
+    // RTL reading (right→left): checkbox → white label → status ("after" the label).
+    // ImGui draws LTR, so: hint | label | checkbox
+    const float total = hintW + gap + labelW + st.ItemInnerSpacing.x + boxSz;
+    const float lineStartX = ImGui::GetWindowContentRegionMin().x;
+    if (ImGui::GetCursorPosX() <= lineStartX + 1.0f)
+        RtlAlignNext(total);
+
+    ImGui::BeginGroup();
+    ImGui::AlignTextToFramePadding();
+    ImGui::PushStyleColor(ImGuiCol_Text, hintCol);
+    ImGui::TextUnformatted(hint);
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0, gap);
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine(0, st.ItemInnerSpacing.x);
+    const bool pressed = ImGui::Checkbox("##cb", v);
+    ImGui::EndGroup();
+    ImGui::PopTextWrapPos();
+    ImGui::PopID();
+    return pressed;
+}
+
 static constexpr float kHdrBtnIconSz     = 11.f;
 static constexpr float kHdrBtnPadX       = 6.f;
 static constexpr float kHdrBtnPadY       = 2.f;
@@ -2790,6 +3114,7 @@ static bool DrawHeaderLinkButton(const char* id, ImTextureID iconTex, float icon
     const float padX = kHdrBtnPadX;
     const float padY = kHdrBtnPadY;
     const float gapAfterIcon = kHdrBtnGapIcon;
+    const bool rtl = locale::IsRtl();
 
     ImGui::SetWindowFontScale(kHdrBtnFontScale);
     const ImVec2 textSz = ImGui::CalcTextSize(label);
@@ -2815,8 +3140,18 @@ static bool DrawHeaderLinkButton(const char* id, ImTextureID iconTex, float icon
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float midY = (bb.Min.y + bb.Max.y) * 0.5f;
 
+    // RTL: text then icon (mirrored chrome). LTR: icon then text.
+    float iconX, textX;
+    if (rtl) {
+        textX = bb.Min.x + padX;
+        iconX = bb.Max.x - padX - iconSz;
+    } else {
+        iconX = bb.Min.x + padX;
+        textX = bb.Min.x + padX + iconSz + gapAfterIcon;
+    }
+
     if (iconTex) {
-        const ImVec2 iconMin(bb.Min.x + padX, midY - iconSz * 0.5f);
+        const ImVec2 iconMin(iconX, midY - iconSz * 0.5f);
         const ImVec2 iconMax(iconMin.x + iconSz, midY + iconSz * 0.5f);
         dl->AddImage(iconTex, iconMin, iconMax, ImVec2(0, 0), ImVec2(1, 1),
                      IM_COL32(170, 175, 185, 255));
@@ -2825,7 +3160,7 @@ static bool DrawHeaderLinkButton(const char* id, ImTextureID iconTex, float icon
     ImFont* font = ImGui::GetFont();
     const float scaledSize = ImGui::GetFontSize() * kHdrBtnFontScale;
     dl->AddText(font, scaledSize,
-                ImVec2(bb.Min.x + padX + iconSz + gapAfterIcon, midY - textSz.y * 0.5f),
+                ImVec2(textX, midY - textSz.y * 0.5f),
                 IM_COL32(165, 170, 180, 255), label);
 
     if (pressed)
@@ -2839,8 +3174,8 @@ static bool DrawHeaderLinkButton(const char* id, ImTextureID iconTex, float icon
 
 static float CalcHeaderLinkButtonsWidth()
 {
-    const float githubW = CalcHeaderLinkButtonWidth("View on GitHub", kHdrBtnIconSz, kHdrBtnPadX, kHdrBtnGapIcon);
-    const float kofiW   = CalcHeaderLinkButtonWidth("Buy me a coffee", kHdrBtnIconSz, kHdrBtnPadX, kHdrBtnGapIcon);
+    const float githubW = CalcHeaderLinkButtonWidth(locale::T("View on GitHub"), kHdrBtnIconSz, kHdrBtnPadX, kHdrBtnGapIcon);
+    const float kofiW   = CalcHeaderLinkButtonWidth(locale::T("Buy me a coffee"), kHdrBtnIconSz, kHdrBtnPadX, kHdrBtnGapIcon);
     return githubW > kofiW ? githubW : kofiW;
 }
 
@@ -2856,18 +3191,43 @@ static void DrawHeaderExternalLinkButtonsAt(float x, float y)
 
     ImGui::SetCursorPos(ImVec2(x, y));
     DrawHeaderLinkButton("github", (ImTextureID)g_texGitHub, kHdrBtnIconSz,
-                         "View on GitHub", "https://github.com/aneeskhan47/fps-overlay", btnW);
+                         locale::T("View on GitHub"), "https://github.com/aneeskhan47/fps-overlay", btnW);
     ImGui::SetCursorPos(ImVec2(x, y + btnH + kHdrBtnStackGap));
     DrawHeaderLinkButton("kofi", (ImTextureID)g_texKofi, kHdrBtnIconSz,
-                         "Buy me a coffee", "https://ko-fi.com/aneeskhan47", btnW);
+                         locale::T("Buy me a coffee"), "https://ko-fi.com/aneeskhan47", btnW);
 }
 
 static void DrawDeveloperAttributionLine()
 {
-    ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), "Developed by aneeskhan47 & ");
+    if (locale::IsRtl()) {
+        // Build exact visual LTR order: «و المساهمون aneeskhan47 طوّره»
+        // Shape each RTL phrase alone, then join — never reshape the mixed string.
+        static char line[384];
+        const std::string left = locale::ShapeRtlForImGui(locale::TRaw("& contributors"));
+        const std::string right = locale::ShapeRtlForImGui(locale::TRaw("Developed by"));
+        snprintf(line, sizeof(line), "%s aneeskhan47 %s", left.c_str(), right.c_str());
+        ImGui::PushTextWrapPos(-1.0f);
+        RtlAlignNext(ImGui::CalcTextSize(line).x);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(.55f, .75f, 1.f, 1.f));
+        ImGui::TextUnformatted(line);
+        ImGui::PopStyleColor();
+        ImGui::PopTextWrapPos();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                ShellExecuteA(nullptr, "open",
+                    "https://github.com/aneeskhan47/fps-overlay/graphs/contributors?all=1",
+                    nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        return;
+    }
+
+    const char* developed = locale::T("Developed by aneeskhan47 & ");
+    const char* contrib = locale::T("contributors");
+    ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), "%s", developed);
     ImGui::SameLine(0, 0);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(.55f,.75f,1.f,1));
-    ImGui::Text("contributors");
+    ImGui::TextUnformatted(contrib);
     if (ImGui::IsItemHovered()) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -2876,6 +3236,77 @@ static void DrawDeveloperAttributionLine()
                 nullptr, nullptr, SW_SHOWNORMAL);
     }
     ImGui::PopStyleColor();
+}
+
+static void RtlLabeledValue(const char* labelKey, const char* valueUtf8)
+{
+    const char* label = locale::T(labelKey);
+    const char* value = valueUtf8 ? valueUtf8 : "";
+    const ImVec4 col(.50f, .50f, .55f, 1.f);
+    if (!locale::IsRtl()) {
+        ImGui::TextColored(col, "%s%s", label, value);
+        return;
+    }
+    // Tight group on the right — never use wrapping Text() (it splits value/label).
+    const float gap = ImGui::CalcTextSize(" ").x;
+    const float total = ImGui::CalcTextSize(value).x + gap + ImGui::CalcTextSize(label).x;
+    ImGui::PushTextWrapPos(-1.0f);
+    RtlAlignNext(total);
+    ImGui::BeginGroup();
+    ImGui::PushStyleColor(ImGuiCol_Text, col);
+    ImGui::TextUnformatted(value);
+    ImGui::SameLine(0, gap);
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    ImGui::EndGroup();
+    ImGui::PopTextWrapPos();
+}
+
+static void DrawHotkeyRow(const char* labelKey, int listenSlot, int& keyVk)
+{
+    const char* label = locale::T(labelKey);
+    const bool listening = (g_listeningFor == listenSlot);
+    const char* listenHint = locale::T("Press any key...  ");
+    const char* changeLbl = (listenSlot == 1) ? locale::T("Change##1") : locale::T("Change##2");
+    const char* cancelLbl = (listenSlot == 1) ? locale::T("Cancel##1") : locale::T("Cancel##2");
+    const char* keyName = listening ? listenHint : GetKeyName(keyVk);
+
+    if (!locale::IsRtl()) {
+        ImGui::Text("%s", label);
+        ImGui::SameLine(90);
+        if (listening) {
+            ImGui::TextColored(ImVec4(1, .8f, .2f, 1), "%s", listenHint);
+            ImGui::SameLine();
+            if (ImGui::SmallButton(cancelLbl)) g_listeningFor = 0;
+        } else {
+            ImGui::Text("%s", keyName);
+            ImGui::SameLine();
+            if (ImGui::SmallButton(changeLbl)) g_listeningFor = listenSlot;
+        }
+        return;
+    }
+
+    // Pack tightly on the right — no %-12 padding (that created a huge visual gap).
+    const char* btnLbl = listening ? cancelLbl : changeLbl;
+    const float gap = 8.f;
+    const float labelW = ImGui::CalcTextSize(label).x;
+    const float keyW = ImGui::CalcTextSize(keyName).x;
+    const float btnW = ImGui::CalcTextSize(btnLbl).x + ImGui::GetStyle().FramePadding.x * 2.f;
+    RtlAlignNext(btnW + gap + keyW + gap + labelW);
+
+    ImGui::BeginGroup();
+    if (listening) {
+        if (ImGui::SmallButton(btnLbl)) g_listeningFor = 0;
+        ImGui::SameLine(0, gap);
+        ImGui::TextColored(ImVec4(1, .8f, .2f, 1), "%s", keyName);
+    } else {
+        if (ImGui::SmallButton(btnLbl)) g_listeningFor = listenSlot;
+        ImGui::SameLine(0, gap);
+        ImGui::TextUnformatted(keyName);
+    }
+    ImGui::SameLine(0, gap);
+    ImGui::TextUnformatted(label);
+    ImGui::EndGroup();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2887,6 +3318,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
     // ── Load saved configuration ──
     LoadConfig(g_Config);
+    locale::Load(g_Config.language);
+    locale::ApplyImGuiRtlFlags();
 
     // ── Check for updates in background ──
     CheckForUpdatesAsync();
@@ -2923,7 +3356,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     g_isAdmin = IsRunningAsAdmin();
 
     if (!CreateDeviceD3D(g_hwnd)) {
-        MessageBox(g_hwnd, "DirectX 11 initialisation failed.", "FPS Overlay", MB_OK | MB_ICONERROR);
+        MessageBoxW(g_hwnd,
+            locale::ToWide(locale::DialogBody("directx_init_failed", "DirectX 11 initialisation failed.")).c_str(),
+            locale::ToWide(locale::DialogTitle("directx_init_failed", "FPS Overlay")).c_str(),
+            MB_OK | MB_ICONERROR);
         CleanupDeviceD3D(); return 1;
     }
 
@@ -2958,22 +3394,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr; io.LogFilename = nullptr;
 
-    ImFontGlyphRangesBuilder glyphBuilder;
-    glyphBuilder.AddRanges(io.Fonts->GetGlyphRangesDefault());
-    glyphBuilder.AddChar((ImWchar)0x2122); // TRADE MARK SIGN
-    glyphBuilder.AddChar((ImWchar)0x00A9); // COPYRIGHT SIGN
-    glyphBuilder.AddChar((ImWchar)0x00AE); // REGISTERED SIGN
-    static ImVector<ImWchar> s_imguiGlyphRanges;
-    s_imguiGlyphRanges.clear();
-    glyphBuilder.BuildRanges(&s_imguiGlyphRanges);
-    ImFont* font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 17.0f, nullptr,
-                                                s_imguiGlyphRanges.Data);
-    if (!font) { io.Fonts->Clear(); ImFontConfig fc; fc.SizePixels = 16; io.Fonts->AddFontDefault(&fc); }
+    LoadAppFonts();
 
     ApplyStyle();
+    locale::ApplyImGuiRtlFlags();
     ImGui_ImplWin32_Init(g_hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
     InitHeaderIconTextures();
+    g_fontsNeedReload = false;
 
     // ── Timing ──
     using Clock = std::chrono::high_resolution_clock;
@@ -3000,6 +3428,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             if (msg.message == WM_QUIT) g_Running = false;
         }
         if (!g_Running) break;
+
+        if (g_fontsNeedReload) {
+            ImGui_ImplDX11_InvalidateDeviceObjects();
+            LoadAppFonts();
+            ImGui_ImplDX11_CreateDeviceObjects();
+            locale::ApplyImGuiRtlFlags();
+            g_fontsNeedReload = false;
+        }
 
         static bool s_appliedLhwmCpuTempLift = false;
         if (g_lhwmInitFinished.load(std::memory_order_acquire) && !s_appliedLhwmCpuTempLift) {
@@ -3048,33 +3484,56 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                 ImGuiWindowFlags_NoSavedSettings);
 
+
             // ── Title ──
             const float headerY = ImGui::GetCursorPosY();
-            ImGui::SetWindowFontScale(1.4f);
-            ImGui::TextColored(ImVec4(.35f,.78f,1,1), "FPS Overlay");
-            ImGui::SetWindowFontScale(1.0f);
-            ImGui::SameLine(); ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " %s", APP_VERSION);
-
-            const float titleRowBottom = ImGui::GetCursorPosY();
+            const bool rtl = locale::IsRtl();
             const float headerButtonsW = CalcHeaderLinkButtonsWidth();
             const float headerButtonsH = CalcHeaderLinkButtonsHeight();
-            const float headerButtonsX = ImGui::GetWindowContentRegionMax().x - headerButtonsW;
-            DrawHeaderExternalLinkButtonsAt(headerButtonsX, headerY);
+            float titleRowBottom = headerY;
+            if (rtl) {
+                DrawHeaderExternalLinkButtonsAt(ImGui::GetWindowContentRegionMin().x, headerY);
+                ImGui::SetWindowFontScale(1.4f);
+                const char* title = locale::T("FPS Overlay");
+                const float titleW = ImGui::CalcTextSize(title).x;
+                ImGui::SetWindowFontScale(1.0f);
+                const float verW = ImGui::CalcTextSize(APP_VERSION).x + ImGui::CalcTextSize(" ").x;
+                ImGui::SetCursorPos(ImVec2(ImGui::GetWindowContentRegionMax().x - titleW - verW, headerY));
+                ImGui::SetWindowFontScale(1.4f);
+                ImGui::TextColored(ImVec4(.35f,.78f,1,1), "%s", title);
+                ImGui::SetWindowFontScale(1.0f);
+                ImGui::SameLine(0, 0);
+                ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " %s", APP_VERSION);
+                titleRowBottom = ImGui::GetCursorPosY();
+            } else {
+                ImGui::SetWindowFontScale(1.4f);
+                ImGui::TextColored(ImVec4(.35f,.78f,1,1), "%s", locale::T("FPS Overlay"));
+                ImGui::SetWindowFontScale(1.0f);
+                ImGui::SameLine(); ImGui::TextColored(ImVec4(.45f,.45f,.5f,1), " %s", APP_VERSION);
+                titleRowBottom = ImGui::GetCursorPosY();
+                const float headerButtonsX = ImGui::GetWindowContentRegionMax().x - headerButtonsW;
+                DrawHeaderExternalLinkButtonsAt(headerButtonsX, headerY);
+            }
 
             const float headerButtonsBottom = headerY + headerButtonsH;
             float headerNextY = (titleRowBottom > headerButtonsBottom ? titleRowBottom : headerButtonsBottom) + 4.f;
 
             if (g_updateAvailable) {
                 ImGui::SetCursorPosY(headerNextY);
+                if (rtl) {
+                    const char* upd = locale::T("Update available!");
+                    float bw = ImGui::CalcTextSize(upd).x + ImGui::GetStyle().FramePadding.x * 2.f;
+                    ImGui::SetCursorPosX(ImGui::GetWindowContentRegionMax().x - bw);
+                }
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(.2f,.9f,.4f,1));
-                if (ImGui::SmallButton("Update available!")) {
+                if (ImGui::SmallButton(locale::T("Update available!"))) {
                     ShellExecuteA(nullptr, "open",
                         "https://github.com/aneeskhan47/fps-overlay/releases/latest",
                         nullptr, nullptr, SW_SHOWNORMAL);
                 }
                 ImGui::PopStyleColor();
                 if (ImGui::IsItemHovered())
-                    TooltipWrappedFmt("Click to download %s", g_latestVersion);
+                    TooltipWrappedFmt("%s", locale::TF("Click to download %s", g_latestVersion));
                 headerNextY = ImGui::GetItemRectMax().y + 4.f;
             }
 
@@ -3084,298 +3543,393 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
             ImGui::Separator();
 
-            // ── DISPLAY ──
-            ImGui::Spacing(); ImGui::Spacing();
-            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "DISPLAY");
-            ImGui::Spacing();
-            ImGui::Checkbox("  FPS Counter (game)", &g_Config.showFPS);
-            if (!g_isAdmin) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(.9f,.4f,.2f,1), "(needs admin!)");
-            }
-            ImGui::Checkbox("  CPU Usage", &g_Config.showCpuUsage);
-            ImGui::Checkbox("  CPU Temp", &g_Config.showCpuTemp);
-            ImGui::Checkbox("  CPU Power (W)", &g_Config.showCpuPower);
-            {
-                const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
-                const bool lhwmBad = !g_lhwmAvailable || g_lhwmCpuPowerPath.empty();
-                if (lhwmBusy || lhwmBad) {
-                    ImGui::SameLine();
-                    ImGui::TextColored(lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1),
-                                       lhwmBusy ? "(loading…)" : "(unavailable)");
-                }
-            }
-            ImGui::Checkbox("  CPU Fan (RPM)", &g_Config.showCpuFan);
-            {
-                const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
-                const bool lhwmBad = !g_lhwmAvailable || g_lhwmCpuFanPath.empty();
-                if (lhwmBusy || lhwmBad) {
-                    ImGui::SameLine();
-                    ImGui::TextColored(lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1),
-                                       lhwmBusy ? "(loading…)" : "(unavailable)");
-                }
-            }
-            ImGui::Checkbox("  GPU Usage", &g_Config.showGpuUsage);
-            ImGui::Checkbox("  GPU Temp", &g_Config.showGpuTemp);
-            {
-                const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
-                const bool lhwmBad = !g_lhwmAvailable || g_gpuCount == 0;
-                if (lhwmBusy || lhwmBad) {
-                    ImGui::SameLine();
-                    ImGui::TextColored(lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1),
-                                       lhwmBusy ? "(loading…)" : "(unavailable)");
-                }
-            }
-            ImGui::Checkbox("  GPU Power (W)", &g_Config.showGpuPower);
-            {
-                const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
-                const bool lhwmBad = !g_lhwmAvailable || g_gpuCount == 0 || g_lhwmGpuPowerPath.empty();
-                if (lhwmBusy || lhwmBad) {
-                    ImGui::SameLine();
-                    ImGui::TextColored(lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1),
-                                       lhwmBusy ? "(loading…)" : "(unavailable)");
-                }
-            }
-            ImGui::Checkbox("  GPU Fan (RPM)", &g_Config.showGpuFan);
-            {
-                const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
-                const bool lhwmBad = !g_lhwmAvailable || g_gpuCount == 0 || g_lhwmGpuFanPath.empty();
-                if (lhwmBusy || lhwmBad) {
-                    ImGui::SameLine();
-                    ImGui::TextColored(lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1),
-                                       lhwmBusy ? "(loading…)" : "(unavailable)");
-                }
-            }
-            ImGui::Checkbox("  GPU VRAM Usage", &g_Config.showVRAM);
-            if (!g_lhwmInitFinished.load(std::memory_order_acquire)) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(.55f,.55f,.58f,1), "(loading…)");
-            } else if (!g_lhwmAvailable || g_gpuCount == 0) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(.9f,.4f,.2f,1), "(unavailable)");
-            }
-            ImGui::Checkbox("  RAM Usage", &g_Config.showRAM);
-            ImGui::Checkbox("  Show process name", &g_Config.showProcessName);
-            if (ImGui::IsItemHovered())
-                TooltipWrapped("Tracked game / process label on the overlay (all layouts).");
-            ImGui::Checkbox("  Show Time", &g_Config.showTime);
-            if (ImGui::IsItemHovered())
-                TooltipWrapped("Current local time on the overlay (all layouts).");
-            if (g_Config.showTime) {
-                ImGui::Indent(16.f);
-                const char* timeFormats[] = { "24 Hour", "12 Hour (AM/PM)" };
-                ImGui::SetNextItemWidth(-1);
-                ImGui::Combo("  Time Format", &g_Config.timeFormat, timeFormats, 2);
-                ImGui::Checkbox("  Show Seconds", &g_Config.timeShowSeconds);
-                ImGui::Unindent(16.f);
-            }
+            const float footerH = 56.f;
+            const float bodyH = ImGui::GetContentRegionAvail().y - footerH;
+            const float sideW = kSettingsSidebarW;
+            const float gap = ImGui::GetStyle().ItemSpacing.x;
+            const float pageW = ImGui::GetContentRegionAvail().x - sideW - gap;
 
-            // ── GPU SELECTION ──
-            if (g_gpuCount > 0) {
-                ImGui::Spacing(); ImGui::Spacing();
-                ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "GPU SELECTION");
-                ImGui::Spacing();
-                
-                // Build combo preview string
-                const char* previewName = (g_Config.selectedGpu >= 0 && g_Config.selectedGpu < g_gpuCount) 
-                    ? g_gpuList[g_Config.selectedGpu].name 
-                    : "Select GPU...";
-                
-                ImGui::SetNextItemWidth(-1);
-                if (ImGui::BeginCombo("##gpuselect", previewName)) {
-                    for (int i = 0; i < g_gpuCount; i++) {
-                        bool isSelected = (g_Config.selectedGpu == i);
-                        if (ImGui::Selectable(g_gpuList[i].name, isSelected)) {
-                            SelectGpu(i);
+            auto drawSidebar = [&]() {
+                ImGui::BeginChild("##settings_nav", ImVec2(sideW, bodyH), true);
+                const char* tabs[] = {
+                    "Display", "GPU", "Frequency", "Appearance", "Temperature",
+                    "Hotkeys", "Startup", "Language", "About"
+                };
+                for (int i = 0; i < SETTINGS_TAB_COUNT; ++i) {
+                    bool sel = (g_Config.settingsTab == i);
+                    if (ImGui::Selectable(locale::T(tabs[i]), sel))
+                        g_Config.settingsTab = i;
+                }
+                ImGui::EndChild();
+            };
+
+            auto drawPage = [&](float width) {
+                ImGui::BeginChild("##settings_page", ImVec2(width, bodyH), true);
+
+                if (g_Config.settingsTab == SETTINGS_TAB_DISPLAY) {
+                    RtlSectionTitle(locale::T("DISPLAY"));
+                    ImGui::Spacing();
+                    if (!g_isAdmin)
+                        RtlCheckboxHint(locale::T("  FPS Counter (game)"), &g_Config.showFPS,
+                                        locale::T("(needs admin!)"), ImVec4(.9f,.4f,.2f,1));
+                    else
+                        RtlCheckbox(locale::T("  FPS Counter (game)"), &g_Config.showFPS);
+                    RtlCheckbox(locale::T("  CPU Usage"), &g_Config.showCpuUsage);
+                    RtlCheckbox(locale::T("  CPU Temp"), &g_Config.showCpuTemp);
+                    {
+                        const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
+                        const bool lhwmBad = !g_lhwmAvailable || g_lhwmCpuPowerPath.empty();
+                        if (lhwmBusy || lhwmBad)
+                            RtlCheckboxHint(locale::T("  CPU Power (W)"), &g_Config.showCpuPower,
+                                            locale::T(lhwmBusy ? "(loading…)" : "(unavailable)"),
+                                            lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1));
+                        else
+                            RtlCheckbox(locale::T("  CPU Power (W)"), &g_Config.showCpuPower);
+                    }
+                    {
+                        const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
+                        const bool lhwmBad = !g_lhwmAvailable || g_lhwmCpuFanPath.empty();
+                        if (lhwmBusy || lhwmBad)
+                            RtlCheckboxHint(locale::T("  CPU Fan (RPM)"), &g_Config.showCpuFan,
+                                            locale::T(lhwmBusy ? "(loading…)" : "(unavailable)"),
+                                            lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1));
+                        else
+                            RtlCheckbox(locale::T("  CPU Fan (RPM)"), &g_Config.showCpuFan);
+                    }
+                    RtlCheckbox(locale::T("  GPU Usage"), &g_Config.showGpuUsage);
+                    {
+                        const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
+                        const bool lhwmBad = !g_lhwmAvailable || g_gpuCount == 0;
+                        if (lhwmBusy || lhwmBad)
+                            RtlCheckboxHint(locale::T("  GPU Temp"), &g_Config.showGpuTemp,
+                                            locale::T(lhwmBusy ? "(loading…)" : "(unavailable)"),
+                                            lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1));
+                        else
+                            RtlCheckbox(locale::T("  GPU Temp"), &g_Config.showGpuTemp);
+                    }
+                    {
+                        const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
+                        const bool lhwmBad = !g_lhwmAvailable || g_gpuCount == 0 || g_lhwmGpuPowerPath.empty();
+                        if (lhwmBusy || lhwmBad)
+                            RtlCheckboxHint(locale::T("  GPU Power (W)"), &g_Config.showGpuPower,
+                                            locale::T(lhwmBusy ? "(loading…)" : "(unavailable)"),
+                                            lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1));
+                        else
+                            RtlCheckbox(locale::T("  GPU Power (W)"), &g_Config.showGpuPower);
+                    }
+                    {
+                        const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
+                        const bool lhwmBad = !g_lhwmAvailable || g_gpuCount == 0 || g_lhwmGpuFanPath.empty();
+                        if (lhwmBusy || lhwmBad)
+                            RtlCheckboxHint(locale::T("  GPU Fan (RPM)"), &g_Config.showGpuFan,
+                                            locale::T(lhwmBusy ? "(loading…)" : "(unavailable)"),
+                                            lhwmBusy ? ImVec4(.55f,.55f,.58f,1) : ImVec4(.9f,.4f,.2f,1));
+                        else
+                            RtlCheckbox(locale::T("  GPU Fan (RPM)"), &g_Config.showGpuFan);
+                    }
+                    {
+                        const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
+                        const bool lhwmBad = !g_lhwmAvailable || g_gpuCount == 0;
+                        if (lhwmBusy)
+                            RtlCheckboxHint(locale::T("  GPU VRAM Usage"), &g_Config.showVRAM,
+                                            locale::T("(loading…)"), ImVec4(.55f,.55f,.58f,1));
+                        else if (lhwmBad)
+                            RtlCheckboxHint(locale::T("  GPU VRAM Usage"), &g_Config.showVRAM,
+                                            locale::T("(unavailable)"), ImVec4(.9f,.4f,.2f,1));
+                        else
+                            RtlCheckbox(locale::T("  GPU VRAM Usage"), &g_Config.showVRAM);
+                    }
+                    RtlCheckbox(locale::T("  RAM Usage"), &g_Config.showRAM);
+                    RtlCheckbox(locale::T("  Show process name"), &g_Config.showProcessName);
+                    if (ImGui::IsItemHovered())
+                        TooltipWrapped(locale::T("Tracked game / process label on the overlay (all layouts)."));
+                    RtlCheckbox(locale::T("  Show Time"), &g_Config.showTime);
+                    if (ImGui::IsItemHovered())
+                        TooltipWrapped(locale::T("Current local time on the overlay (all layouts)."));
+                    if (g_Config.showTime) {
+                        ImGui::Indent(16.f);
+                        const char* timeFormats[] = { locale::T("24 Hour"), locale::T("12 Hour (AM/PM)") };
+                        ImGui::SetNextItemWidth(-1);
+                        ImGui::Combo("##timefmt", &g_Config.timeFormat, timeFormats, 2);
+                        RtlMutedText(locale::T("  Time Format"));
+                        RtlCheckbox(locale::T("  Show Seconds"), &g_Config.timeShowSeconds);
+                        ImGui::Unindent(16.f);
+                    }
+                }
+                else if (g_Config.settingsTab == SETTINGS_TAB_GPU) {
+                    RtlSectionTitle(locale::T("GPU SELECTION"));
+                    ImGui::Spacing();
+                    if (g_gpuCount > 0) {
+                        const char* previewName = (g_Config.selectedGpu >= 0 && g_Config.selectedGpu < g_gpuCount)
+                            ? g_gpuList[g_Config.selectedGpu].name
+                            : locale::T("Select GPU...");
+                        ImGui::SetNextItemWidth(-1);
+                        if (ImGui::BeginCombo("##gpuselect", previewName)) {
+                            for (int i = 0; i < g_gpuCount; i++) {
+                                bool isSelected = (g_Config.selectedGpu == i);
+                                if (ImGui::Selectable(g_gpuList[i].name, isSelected))
+                                    SelectGpu(i);
+                                if (isSelected) ImGui::SetItemDefaultFocus();
+                            }
+                            ImGui::EndCombo();
                         }
-                        if (isSelected) {
-                            ImGui::SetItemDefaultFocus();
+                        if (g_gpuCount > 1)
+                            RtlMutedText(locale::T("Multiple GPUs detected - select which to monitor"));
+                    } else {
+                        ImGui::TextColored(ImVec4(.55f,.55f,.58f,1), "%s",
+                            locale::T(!g_lhwmInitFinished.load(std::memory_order_acquire)
+                                ? "(loading…)" : "(unavailable)"));
+                    }
+                }
+                else if (g_Config.settingsTab == SETTINGS_TAB_FREQUENCY) {
+                    RtlSectionTitle(locale::T("FREQUENCY"));
+                    ImGui::Spacing();
+                    if (!g_lhwmInitFinished.load(std::memory_order_acquire)) {
+                        ImGui::TextColored(ImVec4(.55f,.55f,.58f,1), "%s", locale::T("Initializing LibreHardwareMonitor…"));
+                    } else if (!g_lhwmAvailable) {
+                        ImGui::TextColored(ImVec4(.55f,.55f,.58f,1), "%s", locale::T("Requires LibreHardwareMonitor."));
+                    } else {
+                        RtlCheckbox(locale::T("  Show CPU frequency"), &g_Config.showCpuFreq);
+                        if (g_Config.showCpuFreq) {
+                            ImGui::Indent();
+                            const char* cpuPrev = locale::T("(select sensor)");
+                            for (const auto& o : g_cpuClockOpts) {
+                                if (strcmp(g_Config.cpuFreqPath, o.second.c_str()) == 0) {
+                                    cpuPrev = o.first.c_str();
+                                    break;
+                                }
+                            }
+                            ImGui::SetNextItemWidth(-1);
+                            if (ImGui::BeginCombo("##cpuclkcombo", cpuPrev)) {
+                                for (const auto& o : g_cpuClockOpts) {
+                                    bool isSel = (strcmp(g_Config.cpuFreqPath, o.second.c_str()) == 0);
+                                    if (ImGui::Selectable(o.first.c_str(), isSel))
+                                        snprintf(g_Config.cpuFreqPath, sizeof(g_Config.cpuFreqPath), "%s", o.second.c_str());
+                                    if (isSel) ImGui::SetItemDefaultFocus();
+                                }
+                                ImGui::EndCombo();
+                            }
+                            if (g_cpuClockOpts.empty())
+                                ImGui::TextColored(ImVec4(.85f,.45f,.35f,1), "%s",
+                                    locale::T("  No CPU clock sensors found."));
+                            ImGui::Unindent();
+                        }
+                        RtlCheckbox(locale::T("  Show GPU core frequency"), &g_Config.showGpuCoreFreq);
+                        if (g_Config.showGpuCoreFreq && g_gpuCount > 0) {
+                            ImGui::Indent();
+                            GpuInfo& gg = g_gpuList[g_Config.selectedGpu];
+                            const char* gpPrev = locale::T("(select sensor)");
+                            for (const auto& o : gg.coreClockOpts) {
+                                if (strcmp(g_Config.gpuCoreFreqPath, o.second.c_str()) == 0) {
+                                    gpPrev = o.first.c_str();
+                                    break;
+                                }
+                            }
+                            ImGui::SetNextItemWidth(-1);
+                            if (ImGui::BeginCombo("##gpclkcombo", gpPrev)) {
+                                for (const auto& o : gg.coreClockOpts) {
+                                    bool isSel = (strcmp(g_Config.gpuCoreFreqPath, o.second.c_str()) == 0);
+                                    if (ImGui::Selectable(o.first.c_str(), isSel))
+                                        snprintf(g_Config.gpuCoreFreqPath, sizeof(g_Config.gpuCoreFreqPath), "%s", o.second.c_str());
+                                    if (isSel) ImGui::SetItemDefaultFocus();
+                                }
+                                ImGui::EndCombo();
+                            }
+                            if (gg.coreClockOpts.empty())
+                                ImGui::TextColored(ImVec4(.85f,.45f,.35f,1), "%s",
+                                    locale::T("  No GPU core clock sensors for this GPU."));
+                            ImGui::Unindent();
                         }
                     }
-                    ImGui::EndCombo();
                 }
-                
-                if (g_gpuCount > 1) {
-                    ImGui::TextColored(ImVec4(.45f,.45f,.50f,1), "Multiple GPUs detected - select which to monitor");
-                }
-            }
+                else if (g_Config.settingsTab == SETTINGS_TAB_APPEARANCE) {
+                    RtlSectionTitle(locale::T("POSITION"));
+                    ImGui::Spacing();
+                    int prevPos = g_Config.position;
+                    if (locale::IsRtl()) {
+                        // Stack vertically in RTL — horizontal SameLine rows fight mirrored radios.
+                        RtlRadioButton(locale::T("Top Right"), &g_Config.position, POS_TOP_RIGHT);
+                        RtlRadioButton(locale::T("Top Center"), &g_Config.position, POS_TOP_CENTER);
+                        RtlRadioButton(locale::T("Top Left"), &g_Config.position, POS_TOP_LEFT);
+                        RtlRadioButton(locale::T("Bottom Right"), &g_Config.position, POS_BOTTOM_RIGHT);
+                        RtlRadioButton(locale::T("Bottom Center"), &g_Config.position, POS_BOTTOM_CENTER);
+                        RtlRadioButton(locale::T("Bottom Left"), &g_Config.position, POS_BOTTOM_LEFT);
+                    } else {
+                        RtlRadioButton(locale::T("Top Left"), &g_Config.position, POS_TOP_LEFT);
+                        ImGui::SameLine(0, 16);
+                        RtlRadioButton(locale::T("Top Center"), &g_Config.position, POS_TOP_CENTER);
+                        ImGui::SameLine(0, 16);
+                        RtlRadioButton(locale::T("Top Right"), &g_Config.position, POS_TOP_RIGHT);
+                        RtlRadioButton(locale::T("Bottom Left"), &g_Config.position, POS_BOTTOM_LEFT);
+                        ImGui::SameLine(0, 16);
+                        RtlRadioButton(locale::T("Bottom Center"), &g_Config.position, POS_BOTTOM_CENTER);
+                        ImGui::SameLine(0, 16);
+                        RtlRadioButton(locale::T("Bottom Right"), &g_Config.position, POS_BOTTOM_RIGHT);
+                    }
+                    if (g_Config.position != prevPos) {
+                        g_Config.customX = -1.0f;
+                        g_Config.customY = -1.0f;
+                    }
+                    RtlMutedText(locale::T("Hold CTRL to drag or right-click overlay"));
 
-            // ── FREQUENCY (sparklines; LHWM clock sensors) ──
-            ImGui::Spacing(); ImGui::Spacing();
-            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "FREQUENCY");
-            ImGui::Spacing();
-            if (!g_lhwmInitFinished.load(std::memory_order_acquire)) {
-                ImGui::TextColored(ImVec4(.55f,.55f,.58f,1), "Initializing LibreHardwareMonitor…");
-            } else if (!g_lhwmAvailable) {
-                ImGui::TextColored(ImVec4(.55f,.55f,.58f,1), "Requires LibreHardwareMonitor.");
-            } else {
-                ImGui::Checkbox("  Show CPU frequency", &g_Config.showCpuFreq);
-                if (g_Config.showCpuFreq) {
-                    ImGui::Indent();
-                    const char* cpuPrev = "(select sensor)";
-                    for (const auto& o : g_cpuClockOpts) {
-                        if (strcmp(g_Config.cpuFreqPath, o.second.c_str()) == 0) {
-                            cpuPrev = o.first.c_str();
+                    ImGui::Spacing(); ImGui::Spacing();
+                    RtlSectionTitle(locale::T("LAYOUT"));
+                    ImGui::Spacing();
+                    RtlRadioButton(locale::T("  Vertical (default)"), &g_Config.layoutStyle, LAYOUT_VERTICAL);
+                    RtlRadioButton(locale::T("  Horizontal compact"), &g_Config.layoutStyle, LAYOUT_HORIZONTAL);
+                    RtlRadioButton(locale::T("  Steam-like bar"), &g_Config.layoutStyle, LAYOUT_STEAM);
+                    if (ImGui::IsItemHovered())
+                        TooltipWrapped(locale::T(
+                            "Black bar with Steam-style FPS / CPU / GPU labels.\n"
+                            "Same stats as horizontal compact (temps, VRAM/RAM detail, process name).\n"
+                            "At 100% size, text matches vertical/horizontal scale."));
+                    ImGui::Spacing();
+                    RtlSectionTitle(locale::T("Overlay size"));
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::SliderInt("##ovscale", &g_Config.overlayScale, 50, 200, "%d%%");
+                    if (ImGui::IsItemHovered())
+                        TooltipWrapped(locale::T(
+                            "Text and spacing scale for vertical, horizontal, and Steam-like layouts.\n"
+                            "Hold CTRL on the overlay and drag to move."));
+
+                    ImGui::Spacing(); ImGui::Spacing();
+                    RtlCheckbox(locale::T("No background (text only)"), &g_Config.transparentBackground);
+                    if (ImGui::IsItemHovered())
+                        TooltipWrapped(locale::T("Render overlay text without a background panel."));
+                    RtlSectionTitle(locale::T("Background opacity"));
+                    ImGui::BeginDisabled(g_Config.transparentBackground);
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::SliderInt("##opac", &g_Config.opacity, 0, 100, "%d%%");
+                    ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        TooltipWrapped(locale::T("Background transparency for all layouts (0%% = invisible, default 85%%)."));
+                    RtlSectionTitle(locale::T("Text opacity"));
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::SliderInt("##txtopac", &g_Config.textOpacity, 20, 100, "%d%%");
+                    if (ImGui::IsItemHovered())
+                        TooltipWrapped(locale::T("Overlay text transparency (independent of background)."));
+                }
+                else if (g_Config.settingsTab == SETTINGS_TAB_TEMPERATURE) {
+                    RtlSectionTitle(locale::T("TEMPERATURE"));
+                    ImGui::Spacing();
+                    int tempUnit = g_Config.useFahrenheit ? 1 : 0;
+                    if (locale::IsRtl()) {
+                        RtlRadioButton(locale::T("Celsius"), &tempUnit, 0);
+                        if (tempUnit == 0) g_Config.useFahrenheit = false;
+                        RtlRadioButton(locale::T("Fahrenheit"), &tempUnit, 1);
+                        if (tempUnit == 1) g_Config.useFahrenheit = true;
+                    } else {
+                        if (RtlRadioButton(locale::T("Celsius"), &tempUnit, 0)) g_Config.useFahrenheit = false;
+                        ImGui::SameLine(0,24);
+                        if (RtlRadioButton(locale::T("Fahrenheit"), &tempUnit, 1)) g_Config.useFahrenheit = true;
+                    }
+                }
+                else if (g_Config.settingsTab == SETTINGS_TAB_HOTKEYS) {
+                    RtlSectionTitle(locale::T("HOTKEYS"));
+                    ImGui::Spacing();
+                    DrawHotkeyRow("Toggle:", 1, g_Config.toggleKey);
+                    DrawHotkeyRow("Exit:", 2, g_Config.exitKey);
+                }
+                else if (g_Config.settingsTab == SETTINGS_TAB_STARTUP) {
+                    RtlSectionTitle(locale::T("STARTUP"));
+                    ImGui::Spacing();
+                    RtlCheckbox(locale::T("  Start overlay immediately"), &g_Config.autoStart);
+                    if (ImGui::IsItemHovered())
+                        TooltipWrapped(locale::T("Skip this window and start the overlay directly next time"));
+                }
+                else if (g_Config.settingsTab == SETTINGS_TAB_LANGUAGE) {
+                    RtlSectionTitle(locale::T("LANGUAGE"));
+                    ImGui::Spacing();
+                    struct LangOpt { const char* code; const char* labelKey; };
+                    static const LangOpt kLangs[] = {
+                        { "en-US", "English" },
+                        { "zh-CN", "Simplified Chinese" },
+                        { "ar",    "Arabic" },
+                        { "fa",    "Persian" },
+                        { "fr",    "French" },
+                        { "nl",    "Dutch" },
+                        { "de",    "German" },
+                        { "it",    "Italian" },
+                        { "es",    "Spanish" },
+                        { "pt-BR", "Portuguese" },
+                        { "pt-PT", "Portuguese (Portugal)" },
+                        { "ja",    "Japanese" },
+                        { "ko",    "Korean" },
+                        { "ru",    "Russian" },
+                        { "pl",    "Polish" },
+                        { "tr",    "Turkish" },
+                    };
+                    int langIdx = 0;
+                    bool matched = false;
+                    for (int i = 0; i < (int)(sizeof(kLangs) / sizeof(kLangs[0])); ++i) {
+                        if (_stricmp(g_Config.language, kLangs[i].code) == 0) {
+                            langIdx = i;
+                            matched = true;
                             break;
                         }
                     }
-                    ImGui::SetNextItemWidth(-1);
-                    if (ImGui::BeginCombo("##cpuclkcombo", cpuPrev)) {
-                        for (const auto& o : g_cpuClockOpts) {
-                            bool isSel = (strcmp(g_Config.cpuFreqPath, o.second.c_str()) == 0);
-                            if (ImGui::Selectable(o.first.c_str(), isSel))
-                                snprintf(g_Config.cpuFreqPath, sizeof(g_Config.cpuFreqPath), "%s", o.second.c_str());
-                            if (isSel) ImGui::SetItemDefaultFocus();
+                    if (!matched) {
+                        for (int i = 0; i < (int)(sizeof(kLangs) / sizeof(kLangs[0])); ++i) {
+                            const char* code = kLangs[i].code;
+                            const size_t n = strlen(code);
+                            size_t primaryLen = n;
+                            for (size_t k = 0; k < n; ++k) {
+                                if (code[k] == '-' || code[k] == '_') { primaryLen = k; break; }
+                            }
+                            if (_strnicmp(g_Config.language, code, (int)primaryLen) == 0 &&
+                                (g_Config.language[primaryLen] == '\0' ||
+                                 g_Config.language[primaryLen] == '-' ||
+                                 g_Config.language[primaryLen] == '_')) {
+                                langIdx = i;
+                                break;
+                            }
                         }
-                        ImGui::EndCombo();
                     }
-                    if (g_cpuClockOpts.empty())
-                        ImGui::TextColored(ImVec4(.85f,.45f,.35f,1), "  No CPU clock sensors found.");
-                    ImGui::Unindent();
+                    for (int i = 0; i < (int)(sizeof(kLangs) / sizeof(kLangs[0])); ++i) {
+                        if (RtlRadioButton(locale::T(kLangs[i].labelKey), &langIdx, i))
+                            ApplyLanguage(kLangs[i].code);
+                    }
+                }
+                else if (g_Config.settingsTab == SETTINGS_TAB_ABOUT) {
+                    RtlSectionTitle(locale::T("DETECTED HARDWARE"));
+                    ImGui::Spacing();
+                    RtlLabeledValue("CPU:  ", g_cpuName);
+                    RtlLabeledValue("GPU:  ", g_gpuName);
+                    ImGui::Spacing(); ImGui::Spacing();
+                    if (ImGui::Button(locale::T("View on GitHub"), ImVec2(-1, 0)))
+                        ShellExecuteA(nullptr, "open", "https://github.com/aneeskhan47/fps-overlay",
+                                      nullptr, nullptr, SW_SHOWNORMAL);
+                    if (ImGui::Button(locale::T("Buy me a coffee"), ImVec2(-1, 0)))
+                        ShellExecuteA(nullptr, "open", "https://ko-fi.com/aneeskhan47",
+                                      nullptr, nullptr, SW_SHOWNORMAL);
+                    ImGui::Spacing();
+                    DrawDeveloperAttributionLine();
                 }
 
-                ImGui::Checkbox("  Show GPU core frequency", &g_Config.showGpuCoreFreq);
-                if (g_Config.showGpuCoreFreq && g_gpuCount > 0) {
-                    ImGui::Indent();
-                    GpuInfo& gg = g_gpuList[g_Config.selectedGpu];
-                    const char* gpPrev = "(select sensor)";
-                    for (const auto& o : gg.coreClockOpts) {
-                        if (strcmp(g_Config.gpuCoreFreqPath, o.second.c_str()) == 0) {
-                            gpPrev = o.first.c_str();
-                            break;
-                        }
-                    }
-                    ImGui::SetNextItemWidth(-1);
-                    if (ImGui::BeginCombo("##gpclkcombo", gpPrev)) {
-                        for (const auto& o : gg.coreClockOpts) {
-                            bool isSel = (strcmp(g_Config.gpuCoreFreqPath, o.second.c_str()) == 0);
-                            if (ImGui::Selectable(o.first.c_str(), isSel))
-                                snprintf(g_Config.gpuCoreFreqPath, sizeof(g_Config.gpuCoreFreqPath), "%s", o.second.c_str());
-                            if (isSel) ImGui::SetItemDefaultFocus();
-                        }
-                        ImGui::EndCombo();
-                    }
-                    if (gg.coreClockOpts.empty())
-                        ImGui::TextColored(ImVec4(.85f,.45f,.35f,1), "  No GPU core clock sensors for this GPU.");
-                    ImGui::Unindent();
-                }
-            }
+                ImGui::EndChild();
+            };
 
-            // ── POSITION ──
-            ImGui::Spacing(); ImGui::Spacing();
-            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "POSITION");
-            ImGui::Spacing();
-            int prevPos = g_Config.position;
-            ImGui::RadioButton("Top Left", &g_Config.position, POS_TOP_LEFT);
-            ImGui::SameLine(0, 16);
-            ImGui::RadioButton("Top Center", &g_Config.position, POS_TOP_CENTER);
-            ImGui::SameLine(0, 16);
-            ImGui::RadioButton("Top Right", &g_Config.position, POS_TOP_RIGHT);
-            ImGui::RadioButton("Bottom Left", &g_Config.position, POS_BOTTOM_LEFT);
-            ImGui::SameLine(0, 16);
-            ImGui::RadioButton("Bottom Center", &g_Config.position, POS_BOTTOM_CENTER);
-            ImGui::SameLine(0, 16);
-            ImGui::RadioButton("Bottom Right", &g_Config.position, POS_BOTTOM_RIGHT);
-            // Reset custom position when corner preset is changed
-            if (g_Config.position != prevPos) {
-                g_Config.customX = -1.0f;
-                g_Config.customY = -1.0f;
-            }
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(.45f,.45f,.50f,1), "Hold CTRL to drag or right-click overlay");
-
-            // ── LAYOUT ──
-            ImGui::Spacing(); ImGui::Spacing();
-            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "LAYOUT");
-            ImGui::Spacing();
-            ImGui::RadioButton("  Vertical (default)", &g_Config.layoutStyle, LAYOUT_VERTICAL);
-            ImGui::RadioButton("  Horizontal compact", &g_Config.layoutStyle, LAYOUT_HORIZONTAL);
-            ImGui::RadioButton("  Steam-like bar", &g_Config.layoutStyle, LAYOUT_STEAM);
-            if (ImGui::IsItemHovered())
-                TooltipWrapped(
-                    "Black bar with Steam-style FPS / CPU / GPU labels.\n"
-                    "Same stats as horizontal compact (temps, VRAM/RAM detail, process name).\n"
-                    "At 100% size, text matches vertical/horizontal scale.");
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "Overlay size");
-            ImGui::Spacing();
-            ImGui::SetNextItemWidth(-1);
-            ImGui::SliderInt("##ovscale", &g_Config.overlayScale, 50, 200, "%d%%");
-            if (ImGui::IsItemHovered())
-                TooltipWrapped(
-                    "Text and spacing scale for vertical, horizontal, and Steam-like layouts.\n"
-                    "Hold CTRL on the overlay and drag to move.");
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "Overlay opacity");
-            ImGui::Spacing();
-            ImGui::SetNextItemWidth(-1);
-            ImGui::SliderInt("##opac", &g_Config.opacity, 30, 100, "%d%%");
-            if (ImGui::IsItemHovered())
-                TooltipWrapped("Background transparency for all layouts (default 85%).");
-            
-            // ── TEMPERATURE UNIT ──
-            ImGui::Spacing(); ImGui::Spacing();
-            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "TEMPERATURE");
-            ImGui::Spacing();
-            int tempUnit = g_Config.useFahrenheit ? 1 : 0;
-            if (ImGui::RadioButton("Celsius", &tempUnit, 0)) g_Config.useFahrenheit = false;
-            ImGui::SameLine(0,24);
-            if (ImGui::RadioButton("Fahrenheit", &tempUnit, 1)) g_Config.useFahrenheit = true;
-
-            // ── HOTKEYS ──
-            ImGui::Spacing(); ImGui::Spacing();
-            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "HOTKEYS");
-            ImGui::Spacing();
-
-            // Toggle key
-            ImGui::Text("Toggle:");
-            ImGui::SameLine(90);
-            if (g_listeningFor == 1) {
-                ImGui::TextColored(ImVec4(1,.8f,.2f,1), "Press any key...  ");
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Cancel##1")) g_listeningFor = 0;
+            // Dear ImGui has no RTL layout mode — mirror by explicit widths:
+            // LTR: [nav | page]   RTL: [page | nav]
+            if (!rtl) {
+                drawSidebar();
+                ImGui::SameLine(0, gap);
+                drawPage(pageW);
             } else {
-                ImGui::Text("%-12s", GetKeyName(g_Config.toggleKey));
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Change##1")) g_listeningFor = 1;
+                drawPage(pageW);
+                ImGui::SameLine(0, gap);
+                drawSidebar();
             }
 
-            // Exit key
-            ImGui::Text("Exit:");
-            ImGui::SameLine(90);
-            if (g_listeningFor == 2) {
-                ImGui::TextColored(ImVec4(1,.8f,.2f,1), "Press any key...  ");
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Cancel##2")) g_listeningFor = 0;
-            } else {
-                ImGui::Text("%-12s", GetKeyName(g_Config.exitKey));
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Change##2")) g_listeningFor = 2;
-            }
-
-            // ── STARTUP ──
-            ImGui::Spacing(); ImGui::Spacing();
-            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "STARTUP");
             ImGui::Spacing();
-            ImGui::Checkbox("  Start overlay immediately", &g_Config.autoStart);
-            if (ImGui::IsItemHovered())
-                TooltipWrapped("Skip this window and start the overlay directly next time");
-
-            // ── HARDWARE ──
-            ImGui::Spacing(); ImGui::Spacing();
-            ImGui::TextColored(ImVec4(.55f,.70f,.95f,1), "DETECTED HARDWARE");
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "CPU:  %s", g_cpuName);
-            ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "GPU:  %s", g_gpuName);
-
-            // ── START BUTTON ──
-            ImGui::Spacing(); ImGui::Spacing(); ImGui::Spacing();
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(.12f,.56f,.37f,1));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(.16f,.68f,.44f,1));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(.10f,.48f,.32f,1));
             ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8);
             const bool lhwmBusy = !g_lhwmInitFinished.load(std::memory_order_acquire);
-            const char* startBtnLabel = lhwmBusy ? "Initializing LibreHardwareMonitor…" : "Start Overlay";
+            const char* startBtnLabel = lhwmBusy
+                ? locale::T("Initializing LibreHardwareMonitor…")
+                : locale::T("Start Overlay");
             ImGui::BeginDisabled(lhwmBusy);
             if (ImGui::Button(startBtnLabel, ImVec2(ImGui::GetContentRegionAvail().x, 42)))
                 g_Pending = CMD_START_OVERLAY;
@@ -3383,7 +3937,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::PopStyleVar();
             ImGui::PopStyleColor(3);
 
-            ImGui::End();
+            ImGui::End(); // ##cfg
             Present(0.08f, 0.08f, 0.10f, 1);
         }
 
@@ -3552,11 +4106,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             // Only show menu if right-click happened while already in interaction mode
             if (ctrlHeld && rightMouseJustPressed) {
                 HMENU m = CreatePopupMenu();
-                AppendMenu(m, MF_STRING, IDM_HIDE, "Hide Overlay");
-                AppendMenu(m, MF_STRING, IDM_RESET_POS, "Reset Position");
+                AppendMenuUtf8(m, MF_STRING, IDM_HIDE, locale::T("Hide Overlay"));
+                AppendMenuUtf8(m, MF_STRING, IDM_RESET_POS, locale::T("Reset Position"));
                 AppendMenu(m, MF_SEPARATOR, 0, nullptr);
-                AppendMenu(m, MF_STRING, IDM_SETTINGS, "Settings");
-                AppendMenu(m, MF_STRING, IDM_EXIT, "Exit");
+                AppendMenuUtf8(m, MF_STRING, IDM_SETTINGS, locale::T("Settings"));
+                AppendMenuUtf8(m, MF_STRING, IDM_EXIT, locale::T("Exit"));
                 SetForegroundWindow(g_hwnd);
                 int cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
                                          cursorPt.x, cursorPt.y, 0, g_hwnd, nullptr);
@@ -3638,9 +4192,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 }
             }
             
-            const float opacityPct = (float)g_Config.opacity;
-            const float overlayBgAlpha = ctrlHeld ? 1.0f : (opacityPct / 100.f);
-            ImGui::SetNextWindowBgAlpha(overlayBgAlpha);
+            ImGui::SetNextWindowBgAlpha(OverlayBgAlpha(ctrlHeld));
 
             const float ovSc = g_Config.overlayScale / 100.f;
 
@@ -3660,7 +4212,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.f * ovSc, 2.f * ovSc));
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
-                ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.f, 0.f, 0.f, 1.f));
+                const float steamBgA = g_Config.transparentBackground && !ctrlHeld ? 0.f : 1.f;
+                ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.f, 0.f, 0.f, steamBgA));
                 ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.22f, 0.22f, 0.24f, 0.f));
             }
 
@@ -3754,12 +4307,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 };
 
                 if (g_Config.showFPS) {
-                    ImGui::TextColored(labFps, "FPS");
+                    ImGui::TextColored(OvColV(labFps), "%s", locale::T("FPS"));
                     ImGui::SameLine(0, hsTight);
                     if (g_etwAvailable && gameFps > 0)
-                        ImGui::TextColored(FpsTierCol(gameFps), "%.0f", gameFps);
+                        ImGui::TextColored(OvColV(FpsTierCol(gameFps)), "%.0f", gameFps);
                     else
-                        ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1.f), "---");
+                        ImGui::TextColored(OvColV(ImVec4(.50f, .50f, .55f, 1.f)), "---");
                     needSep = true;
                 }
 
@@ -3769,14 +4322,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 if (g_Config.showCpuUsage || g_Config.showCpuTemp || wantCpuHzSt || wantCpuPwrSt || wantCpuFanSt) {
                     if (needSep) {
                         ImGui::SameLine(0, hs);
-                        ImGui::TextColored(sepC, "|");
+                        ImGui::TextColored(OvColV(sepC), "|");
                         ImGui::SameLine(0, hs);
                     }
-                    ImGui::TextColored(labCpu, "CPU");
+                    ImGui::TextColored(OvColV(labCpu), "%s", locale::T("CPU"));
                     ImGui::SameLine(0, hsTight);
                     bool anyCpuSteam = false;
                     if (g_Config.showCpuUsage) {
-                        ImGui::TextColored(ColorByLoad(cpuUsage), "%.0f%%", cpuUsage);
+                        ImGui::TextColored(OvColV(ColorByLoad(cpuUsage)), "%.0f%%", cpuUsage);
                         anyCpuSteam = true;
                     }
                     if (g_Config.showCpuTemp) {
@@ -3786,18 +4339,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                             ImVec4 tc = g_cpuTemp > 85 ? ImVec4(1, .3f, .3f, 1)
                                       : g_cpuTemp > 70 ? ImVec4(1, .85f, .15f, 1)
                                                        : ImVec4(.70f, .70f, .75f, 1);
-                            ImGui::TextColored(tc, "%s%.0f\xC2\xB0%s", anyCpuSteam ? " " : "", dispTemp,
+                            ImGui::TextColored(OvColV(tc), "%s%.0f\xC2\xB0%s", anyCpuSteam ? " " : "", dispTemp,
                                                g_Config.useFahrenheit ? "F" : "C");
                             anyCpuSteam = true;
                         } else if (!g_Config.showCpuUsage) {
-                            ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1.f), "---");
+                            ImGui::TextColored(OvColV(ImVec4(.50f, .50f, .55f, 1.f)), "---");
                             anyCpuSteam = true;
                         }
                     }
                     if (wantCpuHzSt) {
                         if (anyCpuSteam) {
                             ImGui::SameLine(0, hsTight);
-                            ImGui::TextColored(sepC, "|");
+                            ImGui::TextColored(OvColV(sepC), "|");
                             ImGui::SameLine(0, hsTight);
                         }
                         InlineFreqSparkMHz("##st_cpu", g_cpuSpark, g_cpuSparkN, g_cpuClockMHz,
@@ -3806,18 +4359,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     if (wantCpuPwrSt && g_cpuPower > 0.f) {
                         if (anyCpuSteam) {
                             ImGui::SameLine(0, hsTight);
-                            ImGui::TextColored(sepC, "|");
+                            ImGui::TextColored(OvColV(sepC), "|");
                             ImGui::SameLine(0, hsTight);
                         }
-                        ImGui::TextColored(ImVec4(.85f, .78f, .55f, 1), "%.0fW", g_cpuPower);
+                        ImGui::TextColored(OvCol(.85f, .78f, .55f, 1), "%s", locale::TF("%.0fW", g_cpuPower));
                     }
                     if (wantCpuFanSt) {
                         if (anyCpuSteam) {
                             ImGui::SameLine(0, hsTight);
-                            ImGui::TextColored(sepC, "|");
+                            ImGui::TextColored(OvColV(sepC), "|");
                             ImGui::SameLine(0, hsTight);
                         }
-                        ImGui::TextColored(ImVec4(.60f, .80f, .90f, 1), "%.0frpm", g_cpuFanRpm);
+                        ImGui::TextColored(OvCol(.60f, .80f, .90f, 1), "%s", locale::TF("%.0frpm", g_cpuFanRpm));
                     }
                     needSep = true;
                 }
@@ -3828,18 +4381,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 if (g_Config.showGpuUsage || g_Config.showGpuTemp || wantGpuHzSt || wantGpuPwrSt || wantGpuFanSt) {
                     if (needSep) {
                         ImGui::SameLine(0, hs);
-                        ImGui::TextColored(sepC, "|");
+                        ImGui::TextColored(OvColV(sepC), "|");
                         ImGui::SameLine(0, hs);
                     }
                     float dispGpuLoad = g_gpuUsage;
                     float dispGpuTemp = g_gpuTemp;
                     bool hasGpuData = g_lhwmAvailable && g_gpuCount > 0;
-                    ImGui::TextColored(labGpu, "GPU");
+                    ImGui::TextColored(OvColV(labGpu), "%s", locale::T("GPU"));
                     ImGui::SameLine(0, hsTight);
                     if (hasGpuData) {
                         bool anyGpuSteam = false;
                         if (g_Config.showGpuUsage) {
-                            ImGui::TextColored(ColorByLoad(dispGpuLoad), "%.0f%%", dispGpuLoad);
+                            ImGui::TextColored(OvColV(ColorByLoad(dispGpuLoad)), "%.0f%%", dispGpuLoad);
                             anyGpuSteam = true;
                         }
                         if (g_Config.showGpuTemp) {
@@ -3849,18 +4402,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                                 ImVec4 tc = dispGpuTemp > 85 ? ImVec4(1, .3f, .3f, 1)
                                           : dispGpuTemp > 70 ? ImVec4(1, .85f, .15f, 1)
                                                              : ImVec4(.70f, .70f, .75f, 1);
-                                ImGui::TextColored(tc, "%s%.0f\xC2\xB0%s", anyGpuSteam ? " " : "", dispTemp,
+                                ImGui::TextColored(OvColV(tc), "%s%.0f\xC2\xB0%s", anyGpuSteam ? " " : "", dispTemp,
                                                    g_Config.useFahrenheit ? "F" : "C");
                                 anyGpuSteam = true;
                             } else if (!g_Config.showGpuUsage) {
-                                ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1.f), "---");
+                                ImGui::TextColored(OvColV(ImVec4(.50f, .50f, .55f, 1.f)), "---");
                                 anyGpuSteam = true;
                             }
                         }
                         if (wantGpuHzSt) {
                             if (anyGpuSteam) {
                                 ImGui::SameLine(0, hsTight);
-                                ImGui::TextColored(sepC, "|");
+                                ImGui::TextColored(OvColV(sepC), "|");
                                 ImGui::SameLine(0, hsTight);
                             }
                             InlineFreqSparkMHz("##st_gpu", g_gpuSpark, g_gpuSparkN, g_gpuCoreClockMHz,
@@ -3869,21 +4422,21 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         if (wantGpuPwrSt && g_gpuPower > 0.f) {
                             if (anyGpuSteam) {
                                 ImGui::SameLine(0, hsTight);
-                                ImGui::TextColored(sepC, "|");
+                                ImGui::TextColored(OvColV(sepC), "|");
                                 ImGui::SameLine(0, hsTight);
                             }
-                            ImGui::TextColored(ImVec4(.85f, .78f, .55f, 1), "%.0fW", g_gpuPower);
+                            ImGui::TextColored(OvCol(.85f, .78f, .55f, 1), "%s", locale::TF("%.0fW", g_gpuPower));
                         }
                         if (wantGpuFanSt) {
                             if (anyGpuSteam) {
                                 ImGui::SameLine(0, hsTight);
-                                ImGui::TextColored(sepC, "|");
+                                ImGui::TextColored(OvColV(sepC), "|");
                                 ImGui::SameLine(0, hsTight);
                             }
-                            ImGui::TextColored(ImVec4(.60f, .80f, .90f, 1), "%.0frpm", g_gpuFanRpm);
+                            ImGui::TextColored(OvCol(.60f, .80f, .90f, 1), "%s", locale::TF("%.0frpm", g_gpuFanRpm));
                         }
                     } else {
-                        ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1.f), "N/A");
+                        ImGui::TextColored(OvColV(ImVec4(.50f, .50f, .55f, 1.f)), "N/A");
                     }
                     needSep = true;
                 }
@@ -3894,11 +4447,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     if (dispVramTotal > 0.f) {
                         if (needSep) {
                             ImGui::SameLine(0, hs);
-                            ImGui::TextColored(sepC, "|");
+                            ImGui::TextColored(OvColV(sepC), "|");
                             ImGui::SameLine(0, hs);
                         }
                         float vramPct = (dispVramUsed / dispVramTotal) * 100.0f;
-                        ImGui::TextColored(ColorByLoad(vramPct), "VRAM %.0f%% %.1f/%.0fG", vramPct, dispVramUsed, dispVramTotal);
+                        ImGui::TextColored(OvColV(ColorByLoad(vramPct)), "%s", locale::TF("VRAM %.0f%% %.1f/%.0fG", vramPct, dispVramUsed, dispVramTotal));
                         needSep = true;
                     }
                 }
@@ -3906,11 +4459,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 if (g_Config.showRAM) {
                     if (needSep) {
                         ImGui::SameLine(0, hs);
-                        ImGui::TextColored(sepC, "|");
+                        ImGui::TextColored(OvColV(sepC), "|");
                         ImGui::SameLine(0, hs);
                     }
                     float pct = (ramUsed / ramTotal) * 100;
-                    ImGui::TextColored(ColorByLoad(pct), "RAM %.0f%% %.1f/%.0fG", pct, ramUsed, ramTotal);
+                    ImGui::TextColored(OvColV(ColorByLoad(pct)), "%s", locale::TF("RAM %.0f%% %.1f/%.0fG", pct, ramUsed, ramTotal));
                 }
 
                 if (showMetaLine) {
@@ -3919,10 +4472,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         FormatOverlayTime(g_Config, timeBuf, sizeof(timeBuf));
                     ImGui::SetWindowFontScale(0.78f * ss);
                     if (showProcLine)
-                        ImGui::TextColored(ImVec4(.42f, .52f, .42f, 1.f), "%s", g_targetProcessName);
+                        ImGui::TextColored(OvColV(ImVec4(.42f, .52f, .42f, 1.f)), "%s", g_targetProcessName);
                     if (showTimeLine) {
                         if (showProcLine) ImGui::SameLine(0, 10.f * ss);
-                        ImGui::TextColored(ImVec4(.55f, .65f, .78f, 1.f), "%s", timeBuf);
+                        ImGui::TextColored(OvColV(ImVec4(.55f, .65f, .78f, 1.f)), "%s", timeBuf);
                     }
                 }
 
@@ -3941,9 +4494,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         ImVec4 col = gameFps >= 60 ? ImVec4(.18f,.94f,.45f,1)
                                    : gameFps >= 30 ? ImVec4(1,.85f,.15f,1)
                                                    : ImVec4(1,.25f,.25f,1);
-                        ImGui::TextColored(col, "FPS %.0f", gameFps);
+                        ImGui::TextColored(OvColV(col), "%s", locale::TF("FPS %.0f", gameFps));
                     } else {
-                        ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "FPS ---");
+                        ImGui::TextColored(OvCol(.50f,.50f,.55f,1), "%s", locale::T("FPS ---"));
                     }
                     needSep = true;
                 }
@@ -3959,14 +4512,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     if (g_Config.showCpuUsage || g_Config.showCpuTemp || wantCpuHzHz || wantCpuPwrHz || wantCpuFanHz) {
                         if (needSep) {
                             ImGui::SameLine();
-                            ImGui::TextColored(ImVec4(.35f, .35f, .40f, 1), " | ");
+                            ImGui::TextColored(OvColV(ImVec4(.35f, .35f, .40f, 1)), " | ");
                             ImGui::SameLine();
                         }
                         const bool hasCpuTempVal = g_cpuTempAvailable && g_cpuTemp > 0;
                         if (g_Config.showCpuUsage)
-                            ImGui::TextColored(ColorByLoad(cpuUsage), "CPU %.0f%%", cpuUsage);
+                            ImGui::TextColored(OvColV(ColorByLoad(cpuUsage)), "%s", locale::TF("CPU %.0f%%", cpuUsage));
                         else if (g_Config.showCpuTemp || wantCpuHzHz || wantCpuPwrHz || wantCpuFanHz)
-                            ImGui::TextColored(ImVec4(.78f, .78f, .82f, 1), "CPU");
+                            ImGui::TextColored(OvCol(.78f, .78f, .82f, 1), "%s", locale::T("CPU"));
 
                         if (g_Config.showCpuTemp && hasCpuTempVal) {
                             float dispTemp = ToDisplayTemp(g_cpuTemp, g_Config.useFahrenheit);
@@ -3975,16 +4528,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                                                        : ImVec4(.70f, .70f, .75f, 1);
                             if (g_Config.showCpuUsage) ImGui::SameLine(0, 2);
                             else ImGui::SameLine(0, 4);
-                            ImGui::TextColored(tc, "%.0f\xC2\xB0%s", dispTemp,
+                            ImGui::TextColored(OvColV(tc), "%.0f\xC2\xB0%s", dispTemp,
                                                g_Config.useFahrenheit ? "F" : "C");
                         } else if (g_Config.showCpuTemp && !g_Config.showCpuUsage) {
                             ImGui::SameLine(0, 2);
-                            ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1), "---");
+                            ImGui::TextColored(OvCol(.50f, .50f, .55f, 1), "%s", locale::T("---"));
                         }
 
                         if (wantCpuHzHz) {
                             ImGui::SameLine();
-                            ImGui::TextColored(ImVec4(.35f, .35f, .40f, 1), " | ");
+                            ImGui::TextColored(OvColV(ImVec4(.35f, .35f, .40f, 1)), " | ");
                             ImGui::SameLine();
                             InlineFreqSparkMHz("##hz_cpu", g_cpuSpark, g_cpuSparkN, g_cpuClockMHz,
                                                ImVec2(52.f * ovSc, 12.f * ovSc), 6.f * ovSc,
@@ -3992,11 +4545,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         }
                         if (wantCpuPwrHz && g_cpuPower > 0.f) {
                             ImGui::SameLine(0, 2);
-                            ImGui::TextColored(ImVec4(.85f, .78f, .55f, 1), " %.0fW", g_cpuPower);
+                            ImGui::TextColored(OvCol(.85f, .78f, .55f, 1), " %s", locale::TF("%.0fW", g_cpuPower));
                         }
                         if (wantCpuFanHz) {
                             ImGui::SameLine(0, 2);
-                            ImGui::TextColored(ImVec4(.60f, .80f, .90f, 1), " %.0frpm", g_cpuFanRpm);
+                            ImGui::TextColored(OvCol(.60f, .80f, .90f, 1), " %s", locale::TF("%.0frpm", g_cpuFanRpm));
                         }
                         needSep = true;
                     }
@@ -4013,7 +4566,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     if (g_Config.showGpuUsage || g_Config.showGpuTemp || wantGpuHzHz || wantGpuPwrHz || wantGpuFanHz) {
                         if (needSep) {
                             ImGui::SameLine();
-                            ImGui::TextColored(ImVec4(.35f, .35f, .40f, 1), " | ");
+                            ImGui::TextColored(OvColV(ImVec4(.35f, .35f, .40f, 1)), " | ");
                             ImGui::SameLine();
                         }
 
@@ -4023,9 +4576,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
                         if (hasGpuData) {
                             if (g_Config.showGpuUsage)
-                                ImGui::TextColored(ColorByLoad(dispGpuLoad), "GPU %.0f%%", dispGpuLoad);
+                                ImGui::TextColored(OvColV(ColorByLoad(dispGpuLoad)), "%s", locale::TF("GPU %.0f%%", dispGpuLoad));
                             else if (g_Config.showGpuTemp || wantGpuHzHz || wantGpuPwrHz || wantGpuFanHz)
-                                ImGui::TextColored(ImVec4(.78f, .78f, .82f, 1), "GPU");
+                                ImGui::TextColored(OvColV(ImVec4(.78f, .78f, .82f, 1)), "GPU");
 
                             if (g_Config.showGpuTemp && dispGpuTemp > 0) {
                                 float dispTemp = ToDisplayTemp(dispGpuTemp, g_Config.useFahrenheit);
@@ -4034,16 +4587,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                                                              : ImVec4(.70f, .70f, .75f, 1);
                                 if (g_Config.showGpuUsage) ImGui::SameLine(0, 2);
                                 else ImGui::SameLine(0, 4);
-                                ImGui::TextColored(tc, "%.0f\xC2\xB0%s", dispTemp,
+                                ImGui::TextColored(OvColV(tc), "%.0f\xC2\xB0%s", dispTemp,
                                                    g_Config.useFahrenheit ? "F" : "C");
                             } else if (g_Config.showGpuTemp && !g_Config.showGpuUsage) {
                                 ImGui::SameLine(0, 2);
-                                ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1), "---");
+                                ImGui::TextColored(OvCol(.50f, .50f, .55f, 1), "%s", locale::T("---"));
                             }
 
                             if (wantGpuHzHz) {
                                 ImGui::SameLine();
-                                ImGui::TextColored(ImVec4(.35f, .35f, .40f, 1), " | ");
+                                ImGui::TextColored(OvColV(ImVec4(.35f, .35f, .40f, 1)), " | ");
                                 ImGui::SameLine();
                                 InlineFreqSparkMHz("##hz_gpu", g_gpuSpark, g_gpuSparkN, g_gpuCoreClockMHz,
                                                    ImVec2(52.f * ovSc, 12.f * ovSc), 6.f * ovSc,
@@ -4051,14 +4604,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                             }
                             if (wantGpuPwrHz && g_gpuPower > 0.f) {
                                 ImGui::SameLine(0, 2);
-                                ImGui::TextColored(ImVec4(.85f, .78f, .55f, 1), " %.0fW", g_gpuPower);
+                                ImGui::TextColored(OvCol(.85f, .78f, .55f, 1), " %s", locale::TF("%.0fW", g_gpuPower));
                             }
                             if (wantGpuFanHz) {
                                 ImGui::SameLine(0, 2);
-                                ImGui::TextColored(ImVec4(.60f, .80f, .90f, 1), " %.0frpm", g_gpuFanRpm);
+                                ImGui::TextColored(OvCol(.60f, .80f, .90f, 1), " %s", locale::TF("%.0frpm", g_gpuFanRpm));
                             }
                         } else {
-                            ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1), "GPU N/A");
+                            ImGui::TextColored(OvColV(ImVec4(.50f, .50f, .55f, 1)), "GPU N/A");
                         }
                         needSep = true;
                     }
@@ -4069,18 +4622,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                     float dispVramUsed = g_vramUsed;
                     float dispVramTotal = g_vramTotal;
                     if (dispVramTotal > 0) {
-                        if (needSep) { ImGui::SameLine(); ImGui::TextColored(ImVec4(.35f,.35f,.40f,1), " | "); ImGui::SameLine(); }
+                        if (needSep) { ImGui::SameLine(); ImGui::TextColored(OvColV(ImVec4(.35f,.35f,.40f,1)), " | "); ImGui::SameLine(); }
                         float vramPct = (dispVramUsed / dispVramTotal) * 100.0f;
-                        ImGui::TextColored(ColorByLoad(vramPct), "VRAM %.0f%% %.1f/%.0fG", vramPct, dispVramUsed, dispVramTotal);
+                        ImGui::TextColored(OvColV(ColorByLoad(vramPct)), "%s", locale::TF("VRAM %.0f%% %.1f/%.0fG", vramPct, dispVramUsed, dispVramTotal));
                         needSep = true;
                     }
                 }
                 
                 // RAM
                 if (g_Config.showRAM) {
-                    if (needSep) { ImGui::SameLine(); ImGui::TextColored(ImVec4(.35f,.35f,.40f,1), " | "); ImGui::SameLine(); }
+                    if (needSep) { ImGui::SameLine(); ImGui::TextColored(OvColV(ImVec4(.35f,.35f,.40f,1)), " | "); ImGui::SameLine(); }
                     float pct = (ramUsed / ramTotal) * 100;
-                    ImGui::TextColored(ColorByLoad(pct), "RAM %.0f%% %.1f/%.0fG", pct, ramUsed, ramTotal);
+                    ImGui::TextColored(OvColV(ColorByLoad(pct)), "%s", locale::TF("RAM %.0f%% %.1f/%.0fG", pct, ramUsed, ramTotal));
                 }
                 
                 // Process name / time on second line (compact)
@@ -4090,11 +4643,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         FormatOverlayTime(g_Config, timeBuf, sizeof(timeBuf));
                     ImGui::SetWindowFontScale(0.78f * ovSc);
                     if (g_Config.showFPS && g_Config.showProcessName && g_targetProcessName[0])
-                        ImGui::TextColored(ImVec4(.42f,.52f,.42f,1), "%s", g_targetProcessName);
+                        ImGui::TextColored(OvColV(ImVec4(.42f,.52f,.42f,1)), "%s", g_targetProcessName);
                     if (g_Config.showTime) {
                         if (g_Config.showFPS && g_Config.showProcessName && g_targetProcessName[0])
                             ImGui::SameLine(0, 10.f * ovSc);
-                        ImGui::TextColored(ImVec4(.55f,.65f,.78f,1), "%s", timeBuf);
+                        ImGui::TextColored(OvColV(ImVec4(.55f,.65f,.78f,1)), "%s", timeBuf);
                     }
                     ImGui::SetWindowFontScale(ovSc);
                 }
@@ -4113,19 +4666,19 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         ImVec4 col = gameFps >= 60 ? ImVec4(.18f,.94f,.45f,1)
                                    : gameFps >= 30 ? ImVec4(1,.85f,.15f,1)
                                                    : ImVec4(1,.25f,.25f,1);
-                        ImGui::TextColored(col, "FPS  %.0f", gameFps);
+                        ImGui::TextColored(OvColV(col), "%s", locale::TF("FPS  %.0f", gameFps));
                     } else {
-                        ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "FPS  ---");
+                        ImGui::TextColored(OvCol(.50f,.50f,.55f,1), "%s", locale::T("FPS  ---"));
                     }
                     // Show tracked process name
                     if (g_Config.showProcessName) {
                         if (g_targetProcessName[0]) {
                             ImGui::SetWindowFontScale(0.82f * ovSc);
-                            ImGui::TextColored(ImVec4(.42f,.55f,.42f,1), "  %s", g_targetProcessName);
+                            ImGui::TextColored(OvCol(.42f,.55f,.42f,1), "  %s", g_targetProcessName);
                             ImGui::SetWindowFontScale(ovSc);
                         } else {
                             ImGui::SetWindowFontScale(0.82f * ovSc);
-                            ImGui::TextColored(ImVec4(.50f,.50f,.55f,1), "  (no process)");
+                            ImGui::TextColored(OvCol(.50f,.50f,.55f,1), "%s", locale::T("  (no process)"));
                             ImGui::SetWindowFontScale(ovSc);
                         }
                     }
@@ -4133,14 +4686,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         char timeBuf[32];
                         FormatOverlayTime(g_Config, timeBuf, sizeof(timeBuf));
                         ImGui::SetWindowFontScale(0.82f * ovSc);
-                        ImGui::TextColored(ImVec4(.55f,.65f,.78f,1), "  %s", timeBuf);
+                        ImGui::TextColored(OvCol(.55f,.65f,.78f,1), "  %s", timeBuf);
                         ImGui::SetWindowFontScale(ovSc);
                     }
                     needSep = true;
                 } else if (g_Config.showTime) {
                     char timeBuf[32];
                     FormatOverlayTime(g_Config, timeBuf, sizeof(timeBuf));
-                    ImGui::TextColored(ImVec4(.55f,.65f,.78f,1), "TIME  %s", timeBuf);
+                    ImGui::TextColored(OvCol(.55f,.65f,.78f,1), "%s", locale::TF("TIME  %s", timeBuf));
                     needSep = true;
                 }
 
@@ -4160,31 +4713,31 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         }
                         const bool hasCpuTempVal = g_cpuTempAvailable && g_cpuTemp > 0;
                         if (g_Config.showCpuUsage)
-                            ImGui::TextColored(ColorByLoad(cpuUsage), "CPU  %.0f%%", cpuUsage);
+                            ImGui::TextColored(OvColV(ColorByLoad(cpuUsage)), "%s", locale::TF("CPU  %.0f%%", cpuUsage));
                         if (g_Config.showCpuTemp && hasCpuTempVal) {
                             float dispTemp = ToDisplayTemp(g_cpuTemp, g_Config.useFahrenheit);
                             ImVec4 tc = g_cpuTemp > 85 ? ImVec4(1, .3f, .3f, 1)
                                       : g_cpuTemp > 70 ? ImVec4(1, .85f, .15f, 1)
                                                        : ImVec4(.70f, .70f, .75f, 1);
                             if (g_Config.showCpuUsage) ImGui::SameLine();
-                            else ImGui::TextColored(ImVec4(.82f, .82f, .88f, 1), "CPU  ");
+                            else ImGui::TextColored(OvCol(.82f, .82f, .88f, 1), "%s", locale::T("CPU  "));
                             if (!g_Config.showCpuUsage) ImGui::SameLine(0, 0);
-                            ImGui::TextColored(tc, "%.0f\xC2\xB0%s", dispTemp,
+                            ImGui::TextColored(OvColV(tc), "%.0f\xC2\xB0%s", dispTemp,
                                                g_Config.useFahrenheit ? "F" : "C");
                         } else if (g_Config.showCpuTemp && !g_Config.showCpuUsage) {
-                            ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1), "CPU  ---");
+                            ImGui::TextColored(OvColV(ImVec4(.50f, .50f, .55f, 1)), "CPU  ---");
                         }
 
                         if (wantCpuPwrV && g_cpuPower > 0.f)
-                            ImGui::TextColored(ImVec4(.85f, .78f, .55f, 1), "PWR  %.0f W", g_cpuPower);
+                            ImGui::TextColored(OvCol(.85f, .78f, .55f, 1), "%s", locale::TF("PWR  %.0f W", g_cpuPower));
                         if (wantCpuFanV)
-                            ImGui::TextColored(ImVec4(.60f, .80f, .90f, 1), "FAN  %.0f RPM", g_cpuFanRpm);
+                            ImGui::TextColored(OvCol(.60f, .80f, .90f, 1), "%s", locale::TF("FAN  %.0f RPM", g_cpuFanRpm));
                         ImGui::SetWindowFontScale(0.82f * ovSc);
-                        ImGui::TextColored(ImVec4(.42f, .42f, .48f, 1), "  %s", g_cpuName);
+                        ImGui::TextColored(OvColV(ImVec4(.42f, .42f, .48f, 1)), "  %s", g_cpuName);
                         ImGui::SetWindowFontScale(ovSc);
                         if (wantCpuHzV) {
                             ImGui::Dummy(ImVec2(0, 3.f * ovSc));
-                            ImGui::TextColored(ImVec4(.48f, .58f, .65f, 1), "CPU MHz");
+                            ImGui::TextColored(OvCol(.48f, .58f, .65f, 1), "%s", locale::T("CPU MHz"));
                             ImGui::SameLine();
                             DrawMiniSpark("##vsp_cpu", g_cpuSpark, g_cpuSparkN, g_cpuClockMHz,
                                           ImVec2(130.f * ovSc, 24.f * ovSc));
@@ -4219,41 +4772,41 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
                         if (hasGpuData) {
                             if (g_Config.showGpuUsage)
-                                ImGui::TextColored(ColorByLoad(dispGpuLoad), "GPU  %.0f%%", dispGpuLoad);
+                                ImGui::TextColored(OvColV(ColorByLoad(dispGpuLoad)), "%s", locale::TF("GPU  %.0f%%", dispGpuLoad));
                             if (g_Config.showGpuTemp && dispGpuTemp > 0) {
                                 float dispTemp = ToDisplayTemp(dispGpuTemp, g_Config.useFahrenheit);
                                 ImVec4 tc = dispGpuTemp > 85 ? ImVec4(1, .3f, .3f, 1)
                                           : dispGpuTemp > 70 ? ImVec4(1, .85f, .15f, 1)
                                                              : ImVec4(.70f, .70f, .75f, 1);
                                 if (g_Config.showGpuUsage) ImGui::SameLine();
-                                else ImGui::TextColored(ImVec4(.82f, .82f, .88f, 1), "GPU  ");
+                                else ImGui::TextColored(OvCol(.82f, .82f, .88f, 1), "%s", locale::T("GPU  "));
                                 if (!g_Config.showGpuUsage) ImGui::SameLine(0, 0);
-                                ImGui::TextColored(tc, "%.0f\xC2\xB0%s", dispTemp,
+                                ImGui::TextColored(OvColV(tc), "%.0f\xC2\xB0%s", dispTemp,
                                                    g_Config.useFahrenheit ? "F" : "C");
                             } else if (g_Config.showGpuTemp && !g_Config.showGpuUsage) {
-                                ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1), "GPU  ---");
+                                ImGui::TextColored(OvCol(.50f, .50f, .55f, 1), "%s", locale::T("GPU  ---"));
                             }
                             // VRAM usage
                             if (g_Config.showVRAM && dispVramTotal > 0) {
                                 float vramPct = (dispVramUsed / dispVramTotal) * 100.0f;
-                                ImGui::TextColored(ColorByLoad(vramPct), "VRAM %.0f%%", vramPct);
+                                ImGui::TextColored(OvColV(ColorByLoad(vramPct)), "%s", locale::TF("VRAM %.0f%%", vramPct));
                                 ImGui::SameLine();
-                                ImGui::TextColored(ImVec4(.70f, .70f, .75f, 1), " %.1f / %.0f GB", dispVramUsed,
+                                ImGui::TextColored(OvColV(ImVec4(.70f, .70f, .75f, 1)), " %.1f / %.0f GB", dispVramUsed,
                                                    dispVramTotal);
                             }
                             if (wantGpuPwrV && g_gpuPower > 0.f)
-                                ImGui::TextColored(ImVec4(.85f, .78f, .55f, 1), "PWR  %.0f W", g_gpuPower);
+                                ImGui::TextColored(OvCol(.85f, .78f, .55f, 1), "%s", locale::TF("PWR  %.0f W", g_gpuPower));
                             if (wantGpuFanV)
-                                ImGui::TextColored(ImVec4(.60f, .80f, .90f, 1), "FAN  %.0f RPM", g_gpuFanRpm);
+                                ImGui::TextColored(OvCol(.60f, .80f, .90f, 1), "%s", locale::TF("FAN  %.0f RPM", g_gpuFanRpm));
                         } else {
-                            ImGui::TextColored(ImVec4(.50f, .50f, .55f, 1), "GPU  N/A");
+                            ImGui::TextColored(OvCol(.50f, .50f, .55f, 1), "%s", locale::T("GPU  N/A"));
                         }
                         ImGui::SetWindowFontScale(0.82f * ovSc);
-                        ImGui::TextColored(ImVec4(.42f, .42f, .48f, 1), "  %s", g_gpuName);
+                        ImGui::TextColored(OvColV(ImVec4(.42f, .42f, .48f, 1)), "  %s", g_gpuName);
                         ImGui::SetWindowFontScale(ovSc);
                         if (wantGpuHzV && hasGpuData) {
                             ImGui::Dummy(ImVec2(0, 3.f * ovSc));
-                            ImGui::TextColored(ImVec4(.48f, .58f, .65f, 1), "GPU MHz");
+                            ImGui::TextColored(OvCol(.48f, .58f, .65f, 1), "%s", locale::T("GPU MHz"));
                             ImGui::SameLine();
                             DrawMiniSpark("##vsp_gpu", g_gpuSpark, g_gpuSparkN, g_gpuCoreClockMHz,
                                           ImVec2(130.f * ovSc, 24.f * ovSc));
@@ -4266,9 +4819,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 if (g_Config.showRAM) {
                     if (needSep) { ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing(); }
                     float pct = (ramUsed / ramTotal) * 100;
-                    ImGui::TextColored(ColorByLoad(pct), "RAM  %.0f%%", pct);
+                    ImGui::TextColored(OvColV(ColorByLoad(pct)), "%s", locale::TF("RAM  %.0f%%", pct));
                     ImGui::SameLine();
-                    ImGui::TextColored(ImVec4(.70f,.70f,.75f,1), " %.1f / %.1f GB", ramUsed, ramTotal);
+                    ImGui::TextColored(OvColV(ImVec4(.70f,.70f,.75f,1)), " %.1f / %.1f GB", ramUsed, ramTotal);
                 }
                 ImGui::SetWindowFontScale(1.0f);
             }
@@ -4280,7 +4833,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 ImGui::Spacing();
                 float helpSc = 0.85f * ovSc;
                 ImGui::SetWindowFontScale(helpSc);
-                ImGui::TextColored(ImVec4(0.5f, 0.75f, 1.0f, 1.0f), "Drag to move | Right-click for menu");
+                ImGui::TextColored(OvCol(0.5f, 0.75f, 1.0f, 1.0f), "%s", locale::T("Drag to move | Right-click for menu"));
                 ImGui::SetWindowFontScale(1.0f);
             }
 
@@ -4349,19 +4902,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // Show update option if available
             if (g_updateAvailable) {
                 char updateText[64];
-                snprintf(updateText, sizeof(updateText), "Download Update (%s)", g_latestVersion);
-                AppendMenu(m, MF_STRING, IDM_UPDATE, updateText);
+                snprintf(updateText, sizeof(updateText), "%s", locale::TF("Download Update (%s)", g_latestVersion));
+                AppendMenuUtf8(m, MF_STRING, IDM_UPDATE, updateText);
                 AppendMenu(m, MF_SEPARATOR, 0, nullptr);
             }
             // Show/Hide toggle based on current visibility
             if (g_OvlVisible)
-                AppendMenu(m, MF_STRING, IDM_HIDE, "Hide Overlay");
+                AppendMenuUtf8(m, MF_STRING, IDM_HIDE, locale::T("Hide Overlay"));
             else
-                AppendMenu(m, MF_STRING, IDM_SHOW, "Show Overlay");
+                AppendMenuUtf8(m, MF_STRING, IDM_SHOW, locale::T("Show Overlay"));
             AppendMenu(m, MF_SEPARATOR, 0, nullptr);
-            AppendMenu(m, MF_STRING, IDM_SETTINGS, "Settings");
+            AppendMenuUtf8(m, MF_STRING, IDM_SETTINGS, locale::T("Settings"));
             AppendMenu(m, MF_SEPARATOR, 0, nullptr);
-            AppendMenu(m, MF_STRING, IDM_EXIT, "Exit");
+            AppendMenuUtf8(m, MF_STRING, IDM_EXIT, locale::T("Exit"));
             SetForegroundWindow(hWnd);
             int cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
                                      pt.x, pt.y, 0, hWnd, nullptr);
@@ -4389,11 +4942,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // Only show menu if Ctrl is held AND cursor is over the overlay
             if (ctrlHeld && PtInRect(&g_overlayBounds, pt)) {
                 HMENU m = CreatePopupMenu();
-                AppendMenu(m, MF_STRING, IDM_HIDE, "Hide Overlay");
-                AppendMenu(m, MF_STRING, IDM_RESET_POS, "Reset Position");
+                AppendMenuUtf8(m, MF_STRING, IDM_HIDE, locale::T("Hide Overlay"));
+                AppendMenuUtf8(m, MF_STRING, IDM_RESET_POS, locale::T("Reset Position"));
                 AppendMenu(m, MF_SEPARATOR, 0, nullptr);
-                AppendMenu(m, MF_STRING, IDM_SETTINGS, "Settings");
-                AppendMenu(m, MF_STRING, IDM_EXIT, "Exit");
+                AppendMenuUtf8(m, MF_STRING, IDM_SETTINGS, locale::T("Settings"));
+                AppendMenuUtf8(m, MF_STRING, IDM_EXIT, locale::T("Exit"));
                 SetForegroundWindow(hWnd);
                 int cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
                                          pt.x, pt.y, 0, hWnd, nullptr);
