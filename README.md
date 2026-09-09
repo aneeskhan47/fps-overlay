@@ -54,9 +54,9 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 
 ## Screenshots
 
-| Settings | Vertical layout |
+| Main Settings | Vertical layout |
 |:---:|:---:|
-| ![Settings](screenshots/settings.png) | ![Vertical layout](screenshots/vertical_layout.png) |
+| ![Main Settings](screenshots/main_settings.png) | ![Vertical layout](screenshots/vertical_layout.png) |
 
 | Horizontal compact | Steam-like layout |
 |:---:|:---:|
