@@ -4,6 +4,9 @@ A lightweight, no-bloat FPS overlay for Windows. Just stats on your screen while
 
 ![Size](https://img.shields.io/badge/size-~9MB-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![License](https://img.shields.io/badge/license-GNU%20GPLv3-green) ![Version](https://img.shields.io/badge/version-v1.8.0-blue)
 
+> [!WARNING]
+> **Official Distribution Only:** This GitHub repository (<https://github.com/aneeskhan47/fps-overlay>) is the **only official and authorized source** for FPS Overlay.
+
 > ⭐ If you like FPS Overlay, please leave a star. It supports the project and keeps it growing. Thank you! ⭐
 
 ---
